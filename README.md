@@ -27,7 +27,7 @@ streamlit run app.py
 
 ---
 
----Link to app: https://quantum-hilbert-space-aj1m153.streamlit.app/
+---Link to app: 
 
 ## Extending the Lab
 
