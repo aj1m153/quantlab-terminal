@@ -8,6 +8,78 @@ from plotly.subplots import make_subplots
 import warnings
 warnings.filterwarnings("ignore")
 
+# ── Ticker universe ───────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_all_tickers():
+    """
+    Loads all US-listed equities from the NASDAQ trader FTP file,
+    which covers NASDAQ, NYSE, AMEX and other exchanges (~10 000+ symbols).
+    Falls back to a curated list of ~300 well-known tickers if the fetch fails.
+    Returns a list of strings like  ["AAPL — Apple Inc.", "MSFT — Microsoft Corp.", …]
+    and a plain list of symbols for validation.
+    """
+    import urllib.request, io
+    urls = [
+        "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+    ]
+    rows = []
+    try:
+        for url in urls:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                text = r.read().decode("utf-8")
+            df = pd.read_csv(io.StringIO(text), sep="|")
+            # NASDAQ file has 'Symbol' + 'Security Name'; other has 'ACT Symbol' + 'Security Name'
+            sym_col  = "Symbol"      if "Symbol"      in df.columns else "ACT Symbol"
+            name_col = "Security Name"
+            df = df[[sym_col, name_col]].dropna()
+            df.columns = ["symbol", "name"]
+            # Drop test/warrants/units rows (contain $, ^, ~)
+            df = df[~df["symbol"].str.contains(r"[\$\^\~\s]", regex=True)]
+            df = df[df["symbol"].str.match(r"^[A-Z]{1,5}$")]
+            rows.append(df)
+        all_df = pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol")
+        symbols  = all_df["symbol"].tolist()
+        labels   = (all_df["symbol"] + " — " + all_df["name"].str[:50]).tolist()
+    except Exception:
+        # Fallback curated list
+        fallback = [
+            "AAPL","MSFT","GOOGL","GOOG","AMZN","NVDA","META","TSLA","BRK.B","UNH",
+            "JNJ","XOM","JPM","V","PG","MA","HD","CVX","MRK","ABBV","PEP","KO","AVGO",
+            "COST","LLY","TMO","MCD","ACN","ABT","DHR","WMT","BAC","CSCO","NEE","PM",
+            "BMY","RTX","TXN","QCOM","HON","UPS","AMGN","SBUX","MS","GS","BLK","CAT",
+            "INTU","AMAT","MDT","DE","NOW","ISRG","ADP","REGN","VRTX","ZTS","SPGI",
+            "CI","HUM","AIG","MO","DUK","SO","D","EXC","ED","PEG","XEL","ES","AWK",
+            "GD","LMT","NOC","BA","GE","MMM","ITW","EMR","ETN","ROK","CMI","PH",
+            "SPY","QQQ","IWM","DIA","GLD","SLV","USO","TLT","HYG","LQD",
+            "GS","JPM","WFC","C","BAC","USB","PNC","TFC","COF","AXP",
+            "T","VZ","TMUS","CMCSA","NFLX","DIS","PARA","WBD",
+            "CVS","WBA","MCK","CAH","ABC","ANTM","ELV",
+            "F","GM","STLA","TM","HMC","RIVN","LCID",
+            "SQ","PYPL","COIN","HOOD","SOFI","AFRM",
+            "UBER","LYFT","DASH","ABNB","BKNG","EXPE",
+            "ZM","TEAM","CRM","ORCL","SAP","ADBE","WDAY","SNOW","DDOG","MDB",
+            "AMD","INTC","QCOM","MRVL","KLAC","LRCX","ASML","TSM",
+        ]
+        symbols = sorted(set(fallback))
+        labels  = symbols  # no names in fallback
+    return labels, symbols
+
+_ticker_labels, _ticker_symbols = load_all_tickers()
+
+def ticker_selectbox(label, default, key):
+    """
+    Renders a searchable selectbox over the full ticker universe.
+    Streamlit's native selectbox supports keyboard search out of the box.
+    """
+    try:
+        default_idx = _ticker_symbols.index(default)
+    except ValueError:
+        default_idx = 0
+    chosen = st.selectbox(label, options=_ticker_labels, index=default_idx, key=key)
+    # Extract the bare symbol (everything before ' — ', or the whole string)
+    return chosen.split(" — ")[0].strip()
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="QuantLab Terminal",
@@ -206,7 +278,7 @@ if page == "regime":
 
     with col_cfg:
         st.markdown("**Configuration**")
-        ticker_hmm   = st.text_input("Ticker", value="SPY", key="hmm_tick").upper()
+        ticker_hmm   = ticker_selectbox("Ticker", "SPY", key="hmm_tick")
         period_hmm   = st.selectbox("History", ["2y","3y","5y","10y"], index=2, key="hmm_per")
         n_states_hmm = st.selectbox("HMM States", [2, 3, 4], index=1, key="hmm_st")
         roll_win     = st.slider("Rolling Window (days)", 5, 30, 10, key="hmm_roll")
@@ -382,8 +454,8 @@ elif page == "pairs":
 
     with col_cfg:
         st.markdown("**Configuration**")
-        tick1    = st.text_input("Asset A", value="KO", key="p_t1").upper()
-        tick2    = st.text_input("Asset B", value="PEP", key="p_t2").upper()
+        tick1    = ticker_selectbox("Asset A", "KO",  key="p_t1")
+        tick2    = ticker_selectbox("Asset B", "PEP", key="p_t2")
         period_p = st.selectbox("History", ["2y","3y","5y"], index=1, key="p_per")
         zscore_entry = st.slider("Entry Z-Score", 1.0, 3.0, 2.0, 0.25, key="p_ze")
         zscore_exit  = st.slider("Exit Z-Score",  0.0, 1.5, 0.5, 0.25, key="p_zx")
@@ -555,7 +627,7 @@ elif page == "vol_surface":
 
     with col_cfg:
         st.markdown("**Configuration**")
-        ticker_vs   = st.text_input("Ticker (options-liquid)", value="SPY", key="vs_tick").upper()
+        ticker_vs   = ticker_selectbox("Ticker (options-liquid)", "SPY", key="vs_tick")
         rf_rate     = st.number_input("Risk-Free Rate (%)", value=5.0, step=0.25, key="vs_rf") / 100
         min_oi      = st.number_input("Min Open Interest", value=100, step=50, key="vs_oi")
         colorscale  = st.selectbox("Colorscale", ["Viridis","Plasma","Turbo","RdYlGn"], index=1, key="vs_cs")
@@ -764,7 +836,18 @@ elif page == "cvar":
 
     with col_cfg:
         st.markdown("**Configuration**")
-        tickers_cvar = st.text_area("Tickers (one per line)", value="AAPL\nMSFT\nGOOGL\nAMZN\nJPM\nGS\nXOM\nJNJ", height=200, key="cv_ticks")
+        _cvar_defaults = ["AAPL","MSFT","GOOGL","AMZN","JPM","GS","XOM","JNJ"]
+        _cvar_default_labels = [
+            lbl for lbl in _ticker_labels
+            if lbl.split(" — ")[0].strip() in _cvar_defaults
+        ]
+        tickers_cvar_sel = st.multiselect(
+            "Tickers (search & select)",
+            options=_ticker_labels,
+            default=_cvar_default_labels,
+            key="cv_ticks",
+            help="Type to search across all US-listed stocks"
+        )
         period_cv    = st.selectbox("History", ["2y","3y","5y"], index=1, key="cv_per")
         alpha_cv     = st.slider("CVaR Confidence Level α", 0.90, 0.99, 0.95, 0.01, key="cv_a",
                                   help="Minimise expected loss in worst (1-α)% of days")
@@ -777,7 +860,8 @@ elif page == "cvar":
                 try:
                     import cvxpy as cp
 
-                    tlist = [t.strip().upper() for t in tickers_cvar.strip().split("\n") if t.strip()]
+                    tlist = [lbl.split(" — ")[0].strip() for lbl in tickers_cvar_sel]
+                    tlist = [t for t in tlist if t]
                     if len(tlist) < 2:
                         st.error("Enter at least 2 tickers."); st.stop()
 
