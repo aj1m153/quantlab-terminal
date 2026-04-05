@@ -46,17 +46,19 @@ def yf_ticker_options(ticker_sym):
     return []
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def yf_option_chain(ticker_sym, exp):
-    """Cached fetch of a single option chain expiry."""
+def yf_option_chain_dfs(ticker_sym, exp):
+    """Cached fetch of a single option chain expiry.
+    Returns (calls_df, puts_df) — plain DataFrames are always pickle-serializable."""
     for attempt in range(4):
         try:
-            return yf.Ticker(ticker_sym).option_chain(exp)
+            chain = yf.Ticker(ticker_sym).option_chain(exp)
+            return chain.calls.copy(), chain.puts.copy()
         except Exception as e:
             if "rate" in str(e).lower() or "429" in str(e):
                 time.sleep(2 ** attempt)
                 continue
             raise
-    return None
+    return None, None
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def yf_spot(ticker_sym):
@@ -156,6 +158,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Bust any stale cache entries from previous deployments
+_CACHE_VERSION = "v3"
+if st.session_state.get("_cache_version") != _CACHE_VERSION:
+    st.cache_data.clear()
+    st.session_state["_cache_version"] = _CACHE_VERSION
 
 # ── Global CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -749,15 +757,16 @@ elif page == "vol_surface":
                     progress = st.progress(0, text="Loading expiries…")
                     for idx, exp in enumerate(exps):
                         progress.progress((idx+1)/len(exps), text=f"Expiry {exp}…")
-                        chain = yf_option_chain(ticker_vs, exp)
-                        if chain is None:
+                        calls_df, puts_df = yf_option_chain_dfs(ticker_vs, exp)
+                        if calls_df is None:
                             continue
+                        chain_map = {"calls": calls_df, "puts": puts_df}
                         exp_date = dt.datetime.strptime(exp, "%Y-%m-%d").date()
                         T = (exp_date - today).days / 365.0
                         if T <= 0:
                             continue
                         for flag in flags_to_use:
-                            df_opt = getattr(chain, flag)
+                            df_opt = chain_map[flag]
                             df_opt["openInterest"] = pd.to_numeric(df_opt["openInterest"], errors="coerce").fillna(0)
                             df_opt = df_opt[df_opt["openInterest"] >= min_oi].copy()
                             for _, row in df_opt.iterrows():
