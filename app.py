@@ -7,6 +7,75 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import warnings
 warnings.filterwarnings("ignore")
+import time
+
+# ── yfinance rate-limit resilient downloader ──────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def yf_download(tickers, period, auto_adjust=True):
+    """Cached yfinance download with exponential backoff on rate-limit errors."""
+    for attempt in range(5):
+        try:
+            data = yf.download(
+                tickers, period=period,
+                auto_adjust=auto_adjust, progress=False,
+            )
+            if not data.empty:
+                return data
+        except Exception as e:
+            msg = str(e).lower()
+            if "rate limit" in msg or "too many requests" in msg or "429" in msg:
+                wait = 2 ** attempt
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError(
+        "yfinance is rate-limiting this IP. Wait 1–2 minutes and try again."
+    )
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def yf_ticker_options(ticker_sym):
+    """Cached fetch of option expiry list."""
+    for attempt in range(4):
+        try:
+            return yf.Ticker(ticker_sym).options
+        except Exception as e:
+            if "rate" in str(e).lower() or "429" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    return []
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def yf_option_chain(ticker_sym, exp):
+    """Cached fetch of a single option chain expiry."""
+    for attempt in range(4):
+        try:
+            return yf.Ticker(ticker_sym).option_chain(exp)
+        except Exception as e:
+            if "rate" in str(e).lower() or "429" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def yf_spot(ticker_sym):
+    """Cached spot price fetch."""
+    for attempt in range(4):
+        try:
+            fi = yf.Ticker(ticker_sym).fast_info
+            price = getattr(fi, "last_price", None) or getattr(fi, "regular_market_price", None)
+            if price:
+                return float(price)
+            hist = yf.Ticker(ticker_sym).history(period="1d")
+            if not hist.empty:
+                return float(hist["Close"].iloc[-1])
+        except Exception as e:
+            if "rate" in str(e).lower() or "429" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    return None
 
 # ── Ticker universe ───────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -292,7 +361,7 @@ if page == "regime":
                     from hmmlearn.hmm import GaussianHMM
                     from sklearn.preprocessing import StandardScaler
 
-                    raw = yf.download(ticker_hmm, period=period_hmm, auto_adjust=True, progress=False)
+                    raw = yf_download(ticker_hmm, period=period_hmm)
                     if raw.empty:
                         st.error("No data returned — check ticker symbol.")
                         st.stop()
@@ -391,7 +460,7 @@ if page == "regime":
                     fig.update_yaxes(title_text="Ann. Vol", row=2, col=1)
                     fig.update_yaxes(showticklabels=False, row=3, col=1)
 
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # ── Stats ──────────────────────────────────────────
                     st.markdown("<hr class='divider'>", unsafe_allow_html=True)
@@ -470,7 +539,7 @@ elif page == "pairs":
                     from statsmodels.regression.linear_model import OLS
                     import statsmodels.api as sm
 
-                    raw = yf.download([tick1, tick2], period=period_p, auto_adjust=True, progress=False)["Close"]
+                    raw = yf_download([tick1, tick2], period=period_p)["Close"]
                     raw = raw.dropna()
                     # yfinance returns columns in alphabetical order — remap explicitly
                     available = list(raw.columns)
@@ -590,7 +659,7 @@ elif page == "pairs":
                         fig.update_yaxes(gridcolor="#161b22", showgrid=True, zeroline=False, row=i, col=1)
                     fig.update_annotations(font=dict(family="Space Mono", color="#7d8590", size=9))
 
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # ── Stats ──────────────────────────────────────────
                     st.markdown("<hr class='divider'>", unsafe_allow_html=True)
@@ -664,23 +733,11 @@ elif page == "vol_surface":
                         except Exception:
                             return np.nan
 
-                    tkr  = yf.Ticker(ticker_vs)
-                    spot = None
-                    try:
-                        fi = tkr.fast_info
-                        spot = fi.last_price or fi.regular_market_price
-                    except Exception:
-                        pass
-                    if not spot:
-                        try:
-                            hist = tkr.history(period="1d")
-                            spot = float(hist["Close"].iloc[-1]) if not hist.empty else None
-                        except Exception:
-                            pass
+                    spot = yf_spot(ticker_vs)
                     if not spot:
                         st.error("Could not fetch spot price — check ticker."); st.stop()
 
-                    exps = tkr.options
+                    exps = yf_ticker_options(ticker_vs)
                     if not exps:
                         st.error("No options data available for this ticker."); st.stop()
 
@@ -692,9 +749,8 @@ elif page == "vol_surface":
                     progress = st.progress(0, text="Loading expiries…")
                     for idx, exp in enumerate(exps):
                         progress.progress((idx+1)/len(exps), text=f"Expiry {exp}…")
-                        try:
-                            chain = tkr.option_chain(exp)
-                        except Exception:
+                        chain = yf_option_chain(ticker_vs, exp)
+                        if chain is None:
                             continue
                         exp_date = dt.datetime.strptime(exp, "%Y-%m-%d").date()
                         T = (exp_date - today).days / 365.0
@@ -778,7 +834,7 @@ elif page == "vol_surface":
                         title=dict(text=f"IV Surface · {ticker_vs} · Spot ${spot:.2f}",
                                    font=dict(family="Space Mono", color="#e6edf3", size=12)),
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # ── Smile cross-sections ───────────────────────────
                     st.markdown("<hr class='divider'>", unsafe_allow_html=True)
@@ -803,7 +859,7 @@ elif page == "vol_surface":
                         legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3",size=10)),
                         height=300, margin=dict(l=10, r=10, t=10, b=10)
                     )
-                    st.plotly_chart(smile_fig, use_container_width=True)
+                    st.plotly_chart(smile_fig, width="stretch")
 
                     # Stats
                     m1, m2, m3, m4 = st.columns(4)
@@ -865,7 +921,7 @@ elif page == "cvar":
                     if len(tlist) < 2:
                         st.error("Enter at least 2 tickers."); st.stop()
 
-                    raw = yf.download(tlist, period=period_cv, auto_adjust=True, progress=False)["Close"]
+                    raw = yf_download(tlist, period=period_cv)["Close"]
                     if isinstance(raw, pd.Series):
                         raw = raw.to_frame()
                     raw = raw.dropna(axis=1, how="all").dropna()
@@ -982,7 +1038,7 @@ elif page == "cvar":
                     fig.update_yaxes(title_text="Weight (%)", row=1, col=2)
                     fig.update_annotations(font=dict(family="Space Mono", color="#7d8590", size=9))
 
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # ── Comparison table ───────────────────────────────
                     st.markdown("<hr class='divider'>", unsafe_allow_html=True)
