@@ -276,7 +276,7 @@ if page == "regime":
                         x0, x1 = seg.index[0], seg.index[-1]
                         fig.add_vrect(x0=x0, x1=x1,
                                       fillcolor=color, opacity=0.18,
-                                      layer="below", line_width=0, row=1, col=1)
+                                      layer="below", line_width=0)
 
                     # Regime dots
                     for regime_name, color in COLORS.items():
@@ -401,7 +401,15 @@ elif page == "pairs":
                     raw = yf.download([tick1, tick2], period=period_p, auto_adjust=True, progress=False)["Close"]
                     raw = raw.dropna()
                     # yfinance returns columns in alphabetical order — remap explicitly
-                    col_map = {c: c for c in raw.columns}
+                    available = list(raw.columns)
+                    requested = [tick1, tick2]
+                    # Build map: match available cols to requested tickers (case-insensitive)
+                    col_map = {}
+                    for req in requested:
+                        for av in available:
+                            if av.upper() == req.upper() and av not in col_map.values():
+                                col_map[av] = req
+                                break
                     raw = raw.rename(columns=col_map)
                     if tick1 not in raw.columns or tick2 not in raw.columns:
                         st.error(f"Could not find both tickers in returned data. Got: {list(raw.columns)}")
@@ -452,8 +460,8 @@ elif page == "pairs":
 
                     # Normalised prices
                     for t, col in [(tick1, "#00d4aa"), (tick2, "#f7c948")]:
-                        n = raw[t] / raw[t].iloc[0]
-                        fig.add_trace(go.Scatter(x=raw.index, y=n, mode="lines",
+                        norm_price = raw[t] / raw[t].iloc[0]
+                        fig.add_trace(go.Scatter(x=raw.index, y=norm_price, mode="lines",
                                                  line=dict(color=col, width=1.4), name=t), row=1, col=1)
 
                     # Spread
@@ -588,7 +596,7 @@ elif page == "vol_surface":
                     spot = None
                     try:
                         fi = tkr.fast_info
-                        spot = fi["lastPrice"] or fi["regularMarketPrice"]
+                        spot = fi.last_price or fi.regular_market_price
                     except Exception:
                         pass
                     if not spot:
@@ -799,7 +807,7 @@ elif page == "cvar":
                         z >= 0,
                         z >= -port_ret - aux,
                     ]
-                    cvar_obj = aux + (1 / (k)) * cp.sum(z)
+                    cvar_obj = aux + (1 / float(k)) * cp.sum(z)
                     prob = cp.Problem(cp.Minimize(cvar_obj), constraints)
                     prob.solve(solver=cp.SCS, verbose=False)
 
@@ -865,7 +873,7 @@ elif page == "cvar":
                         fig.add_trace(go.Scatter(x=dates, y=cum, mode="lines",
                                                  line=dict(color=col, width=2, dash=dash),
                                                  name=name), row=1, col=1)
-                    fig.add_hline(y=1, line_color="#21262d", line_width=0.8, row=1, col=1)
+                    fig.add_hline(y=1, line_color="#21262d", line_width=0.8)
 
                     # Weight bar chart
                     sorted_idx = np.argsort(w_cvar)[::-1]
