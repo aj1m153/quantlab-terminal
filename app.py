@@ -10,7 +10,6 @@ import datetime as dt
 import io
 import urllib.request
 
-import requests
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -30,34 +29,9 @@ try:
 except ImportError:
     _YFRateErr = None
 
-# Browser-spoofed session — Yahoo blocks datacenter IPs on the options endpoint
-# without realistic headers. Reuse a single session across all Ticker() calls.
-def _make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT":             "1",
-        "Connection":      "keep-alive",
-    })
-    return s
-
-_SESSION = _make_session()
-
-
 def _ticker(symbol: str) -> yf.Ticker:
-    """Return a Ticker wired up with the spoofed session."""
-    try:
-        return yf.Ticker(symbol, session=_SESSION)
-    except TypeError:
-        # Older yfinance builds don't accept session= keyword
-        return yf.Ticker(symbol)
+    """Return a plain Ticker — yfinance manages its own curl_cffi session internally."""
+    return yf.Ticker(symbol)
 
 
 def _is_rate_limit(exc: Exception) -> bool:
