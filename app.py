@@ -64,9 +64,19 @@ def yf_download(tickers, period: str, auto_adjust: bool = True) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def yf_options_expiries(symbol: str):
-    for attempt in range(5):
+    """
+    Fetch option expiry dates. Retries on both exceptions AND empty returns,
+    since yfinance silently returns () when rate-limited on the options endpoint.
+    """
+    for attempt in range(6):
         try:
-            return yf.Ticker(symbol).options
+            exps = yf.Ticker(symbol).options
+            if exps:                 # non-empty → genuine result
+                return exps
+            if attempt < 4:          # empty could be a silent rate-limit
+                _backoff(attempt)
+                continue
+            return ()                # still empty after retries → no options
         except Exception as exc:
             if _is_rate_limit(exc):
                 _backoff(attempt)
@@ -422,7 +432,11 @@ with st.sidebar:
         if st.button(label, key=f"nav_{key}"):
             st.session_state.page = key
 
-    st.markdown("<hr style='border-color:#21262d;margin:1.4rem 0 1rem;'>", unsafe_allow_html=True)
+    st.markdown("<hr style='border-color:#21262d;margin:1.4rem 0 0.6rem;'>", unsafe_allow_html=True)
+    if st.button("↺  Clear Cache", key="nav_clear"):
+        st.cache_data.clear()
+        st.success("Cache cleared — retry your request.")
+    st.markdown("<hr style='border-color:#21262d;margin:0.6rem 0 1rem;'>", unsafe_allow_html=True)
     st.markdown(
         "<div style='font-family:Space Mono,monospace;font-size:0.58rem;color:#7d8590;line-height:1.9;'>"
         "Data · yfinance<br>Models · hmmlearn · statsmodels<br>"
@@ -819,7 +833,13 @@ elif page == "vol_surface":
 
                     exps = yf_options_expiries(ticker_vs)
                     if not exps:
-                        st.error("No options data for this ticker.")
+                        st.error(
+                            f"**No options data returned for `{ticker_vs}`.**  \n"
+                            "This usually means one of:\n"
+                            "- Yahoo Finance is rate-limiting this IP — wait 60 s and click **Build Surface** again\n"
+                            "- The ticker has no listed options (try SPY · QQQ · AAPL · TSLA · AMZN)\n"
+                            "- A stale empty result is cached — click **↺ Clear Cache** in the sidebar, then retry"
+                        )
                         st.stop()
 
                     today = dt.date.today()
