@@ -377,10 +377,11 @@ PLOT_LAYOUT = dict(
     font=dict(family="Space Mono", color="#7d8590", size=10),
     hovermode="x unified",
     margin=dict(l=10, r=10, t=36, b=10),
-    legend=dict(
-        orientation="h", y=1.04, bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e6edf3", size=10),
-    ),
+)
+
+LEGEND_DEFAULTS = dict(
+    orientation="h", y=1.04, bgcolor="rgba(0,0,0,0)",
+    font=dict(color="#e6edf3", size=10),
 )
 
 def _style_axes(fig, rows=1, cols=1):
@@ -1131,7 +1132,7 @@ elif page == "cvar":
                         marker_color=bar_colors, showlegend=False, name="Weights",
                     ), row=1, col=2)
 
-                    fig.update_layout(**PLOT_LAYOUT, height=420)
+                    fig.update_layout(**PLOT_LAYOUT, legend=dict(**LEGEND_DEFAULTS), height=420)
                     _style_axes(fig, rows=1, cols=2)
                     fig.update_yaxes(title_text="Growth of $1", row=1, col=1)
                     fig.update_yaxes(title_text="Weight (%)",   row=1, col=2)
