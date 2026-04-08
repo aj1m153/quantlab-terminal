@@ -1,3 +1,15 @@
+"""
+QuantLab Terminal — Rewrite
+Modules: Market Regime · Pairs Trading · Vol Surface · CVaR Optimisation
+"""
+
+import time
+import random
+import warnings
+import datetime as dt
+import io
+import urllib.request
+
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -5,91 +17,104 @@ import yfinance as yf
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-import warnings
-warnings.filterwarnings("ignore")
-import time
 
-# ── yfinance rate-limit resilient downloader ──────────────────────────────────
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RATE-LIMIT RESILIENT yfinance HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+try:
+    from yfinance.exceptions import YFRateLimitError as _YFRateErr
+except ImportError:
+    _YFRateErr = None
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    if _YFRateErr and isinstance(exc, _YFRateErr):
+        return True
+    msg = str(exc).lower()
+    return any(k in msg for k in ("rate limit", "too many requests", "429", "ratelimit"))
+
+
+def _backoff(attempt: int) -> None:
+    wait = min(2 ** attempt + random.uniform(0, 2), 60)
+    time.sleep(wait)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def yf_download(tickers, period, auto_adjust=True):
-    """Cached yfinance download with exponential backoff on rate-limit errors."""
-    for attempt in range(5):
+def yf_download(tickers, period: str, auto_adjust: bool = True) -> pd.DataFrame:
+    for attempt in range(6):
         try:
             data = yf.download(
                 tickers, period=period,
-                auto_adjust=auto_adjust, progress=False,
+                auto_adjust=auto_adjust,
+                progress=False,
+                threads=False,   # single-threaded — avoids burst rate-limit
             )
             if not data.empty:
                 return data
-        except Exception as e:
-            msg = str(e).lower()
-            if "rate limit" in msg or "too many requests" in msg or "429" in msg:
-                wait = 2 ** attempt
-                time.sleep(wait)
+        except Exception as exc:
+            if _is_rate_limit(exc):
+                _backoff(attempt)
                 continue
             raise
-    raise RuntimeError(
-        "yfinance is rate-limiting this IP. Wait 1–2 minutes and try again."
-    )
+    raise RuntimeError("Yahoo Finance is rate-limiting this IP. Wait 1–2 min and retry.")
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def yf_ticker_options(ticker_sym):
-    """Cached fetch of option expiry list."""
-    for attempt in range(4):
+def yf_options_expiries(symbol: str):
+    for attempt in range(5):
         try:
-            return yf.Ticker(ticker_sym).options
-        except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
-                time.sleep(2 ** attempt)
+            return yf.Ticker(symbol).options
+        except Exception as exc:
+            if _is_rate_limit(exc):
+                _backoff(attempt)
                 continue
             raise
-    return []
+    return ()
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def yf_option_chain_dfs(ticker_sym, exp):
-    """Cached fetch of a single option chain expiry.
-    Returns (calls_df, puts_df) — plain DataFrames are always pickle-serializable."""
-    for attempt in range(4):
+def yf_option_chain(symbol: str, expiry: str):
+    """Returns (calls_df, puts_df) — plain DataFrames are always serialisable."""
+    for attempt in range(5):
         try:
-            chain = yf.Ticker(ticker_sym).option_chain(exp)
+            chain = yf.Ticker(symbol).option_chain(expiry)
             return chain.calls.copy(), chain.puts.copy()
-        except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
-                time.sleep(2 ** attempt)
+        except Exception as exc:
+            if _is_rate_limit(exc):
+                _backoff(attempt)
                 continue
             raise
     return None, None
 
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def yf_spot(ticker_sym):
-    """Cached spot price fetch."""
-    for attempt in range(4):
+def yf_spot(symbol: str) -> float | None:
+    for attempt in range(5):
         try:
-            fi = yf.Ticker(ticker_sym).fast_info
+            fi = yf.Ticker(symbol).fast_info
             price = getattr(fi, "last_price", None) or getattr(fi, "regular_market_price", None)
             if price:
                 return float(price)
-            hist = yf.Ticker(ticker_sym).history(period="1d")
+            hist = yf.Ticker(symbol).history(period="1d")
             if not hist.empty:
                 return float(hist["Close"].iloc[-1])
-        except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
-                time.sleep(2 ** attempt)
+        except Exception as exc:
+            if _is_rate_limit(exc):
+                _backoff(attempt)
                 continue
             raise
     return None
 
-# ── Ticker universe ───────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TICKER UNIVERSE
+# ──────────────────────────────────────────────────────────────────────────────
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_all_tickers():
-    """
-    Loads all US-listed equities from the NASDAQ trader FTP file,
-    which covers NASDAQ, NYSE, AMEX and other exchanges (~10 000+ symbols).
-    Falls back to a curated list of ~300 well-known tickers if the fetch fails.
-    Returns a list of strings like  ["AAPL — Apple Inc.", "MSFT — Microsoft Corp.", …]
-    and a plain list of symbols for validation.
-    """
-    import urllib.request, io
+def load_ticker_universe():
     urls = [
         "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
         "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
@@ -100,58 +125,49 @@ def load_all_tickers():
             with urllib.request.urlopen(url, timeout=8) as r:
                 text = r.read().decode("utf-8")
             df = pd.read_csv(io.StringIO(text), sep="|")
-            # NASDAQ file has 'Symbol' + 'Security Name'; other has 'ACT Symbol' + 'Security Name'
-            sym_col  = "Symbol"      if "Symbol"      in df.columns else "ACT Symbol"
+            sym_col  = "Symbol" if "Symbol" in df.columns else "ACT Symbol"
             name_col = "Security Name"
             df = df[[sym_col, name_col]].dropna()
             df.columns = ["symbol", "name"]
-            # Drop test/warrants/units rows (contain $, ^, ~)
             df = df[~df["symbol"].str.contains(r"[\$\^\~\s]", regex=True)]
             df = df[df["symbol"].str.match(r"^[A-Z]{1,5}$")]
             rows.append(df)
         all_df = pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol")
-        symbols  = all_df["symbol"].tolist()
-        labels   = (all_df["symbol"] + " — " + all_df["name"].str[:50]).tolist()
+        symbols = all_df["symbol"].tolist()
+        labels  = (all_df["symbol"] + " — " + all_df["name"].str[:50]).tolist()
     except Exception:
-        # Fallback curated list
-        fallback = [
-            "AAPL","MSFT","GOOGL","GOOG","AMZN","NVDA","META","TSLA","BRK.B","UNH",
-            "JNJ","XOM","JPM","V","PG","MA","HD","CVX","MRK","ABBV","PEP","KO","AVGO",
-            "COST","LLY","TMO","MCD","ACN","ABT","DHR","WMT","BAC","CSCO","NEE","PM",
-            "BMY","RTX","TXN","QCOM","HON","UPS","AMGN","SBUX","MS","GS","BLK","CAT",
-            "INTU","AMAT","MDT","DE","NOW","ISRG","ADP","REGN","VRTX","ZTS","SPGI",
-            "CI","HUM","AIG","MO","DUK","SO","D","EXC","ED","PEG","XEL","ES","AWK",
-            "GD","LMT","NOC","BA","GE","MMM","ITW","EMR","ETN","ROK","CMI","PH",
+        fallback = sorted(set([
+            "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","JPM","V","PG",
+            "MA","HD","XOM","CVX","MRK","ABBV","PEP","KO","AVGO","COST","LLY",
+            "TMO","MCD","ACN","ABT","WMT","BAC","CSCO","NEE","PM","BMY","RTX",
+            "TXN","QCOM","HON","UPS","AMGN","SBUX","MS","GS","BLK","CAT","INTU",
+            "AMAT","MDT","DE","NOW","ISRG","ADP","REGN","VRTX","ZTS","SPGI",
             "SPY","QQQ","IWM","DIA","GLD","SLV","USO","TLT","HYG","LQD",
-            "GS","JPM","WFC","C","BAC","USB","PNC","TFC","COF","AXP",
-            "T","VZ","TMUS","CMCSA","NFLX","DIS","PARA","WBD",
-            "CVS","WBA","MCK","CAH","ABC","ANTM","ELV",
-            "F","GM","STLA","TM","HMC","RIVN","LCID",
-            "SQ","PYPL","COIN","HOOD","SOFI","AFRM",
-            "UBER","LYFT","DASH","ABNB","BKNG","EXPE",
-            "ZM","TEAM","CRM","ORCL","SAP","ADBE","WDAY","SNOW","DDOG","MDB",
-            "AMD","INTC","QCOM","MRVL","KLAC","LRCX","ASML","TSM",
-        ]
-        symbols = sorted(set(fallback))
-        labels  = symbols  # no names in fallback
+            "WFC","C","USB","PNC","TFC","COF","AXP","T","VZ","TMUS","CMCSA",
+            "NFLX","DIS","F","GM","RIVN","SQ","PYPL","COIN","UBER","ABNB",
+            "CRM","ORCL","ADBE","SNOW","DDOG","AMD","INTC","MRVL","TSM","ASML",
+        ]))
+        symbols = fallback
+        labels  = fallback
     return labels, symbols
 
-_ticker_labels, _ticker_symbols = load_all_tickers()
 
-def ticker_selectbox(label, default, key):
-    """
-    Renders a searchable selectbox over the full ticker universe.
-    Streamlit's native selectbox supports keyboard search out of the box.
-    """
+_TICKER_LABELS, _TICKER_SYMBOLS = load_ticker_universe()
+
+
+def ticker_select(label: str, default: str, key: str) -> str:
     try:
-        default_idx = _ticker_symbols.index(default)
+        idx = _TICKER_SYMBOLS.index(default)
     except ValueError:
-        default_idx = 0
-    chosen = st.selectbox(label, options=_ticker_labels, index=default_idx, key=key)
-    # Extract the bare symbol (everything before ' — ', or the whole string)
+        idx = 0
+    chosen = st.selectbox(label, options=_TICKER_LABELS, index=idx, key=key)
     return chosen.split(" — ")[0].strip()
 
-# ── Page config ──────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG & THEME
+# ──────────────────────────────────────────────────────────────────────────────
+
 st.set_page_config(
     page_title="QuantLab Terminal",
     page_icon="⬡",
@@ -159,208 +175,288 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Bust any stale cache entries from previous deployments
-_CACHE_VERSION = "v3"
-if st.session_state.get("_cache_version") != _CACHE_VERSION:
+# Reset cache on version bump
+_CACHE_VER = "v4"
+if st.session_state.get("_cv") != _CACHE_VER:
     st.cache_data.clear()
-    st.session_state["_cache_version"] = _CACHE_VERSION
+    st.session_state["_cv"] = _CACHE_VER
 
-# ── Global CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap');
 
 :root {
-    --bg:       #080c10;
-    --surface:  #0d1117;
-    --surface2: #161b22;
-    --border:   #21262d;
-    --accent:   #00d4aa;
-    --accent2:  #f7c948;
-    --accent3:  #ff6b6b;
-    --text:     #e6edf3;
-    --muted:    #7d8590;
-    --bull:     #26a641;
-    --bear:     #da3633;
-    --neutral:  #6e7681;
+    --bg:      #07090d;
+    --surf:    #0d1117;
+    --surf2:   #161b22;
+    --border:  #21262d;
+    --accent:  #00d4aa;
+    --gold:    #f7c948;
+    --red:     #ff6b6b;
+    --text:    #e6edf3;
+    --muted:   #7d8590;
+    --bull:    #26a641;
+    --bear:    #da3633;
 }
 
 html, body, [data-testid="stAppViewContainer"] {
-    background-color: var(--bg) !important;
+    background: var(--bg) !important;
     color: var(--text) !important;
     font-family: 'DM Sans', sans-serif;
 }
-
 [data-testid="stSidebar"] {
-    background-color: var(--surface) !important;
+    background: var(--surf) !important;
     border-right: 1px solid var(--border) !important;
 }
+[data-testid="stSidebar"] .block-container { padding: 1.25rem 1rem; }
 
-[data-testid="stSidebar"] .block-container { padding: 1.5rem 1rem; }
-
-/* Sidebar nav buttons */
+/* sidebar nav buttons */
 div[data-testid="stSidebar"] .stButton button {
     background: transparent !important;
     border: 1px solid var(--border) !important;
     color: var(--muted) !important;
     font-family: 'Space Mono', monospace !important;
-    font-size: 0.72rem !important;
+    font-size: 0.7rem !important;
     text-align: left !important;
     width: 100% !important;
-    padding: 0.6rem 0.9rem !important;
+    padding: 0.55rem 0.9rem !important;
     border-radius: 4px !important;
-    transition: all 0.2s !important;
-    margin-bottom: 4px;
+    transition: all 0.15s !important;
+    margin-bottom: 3px;
+    letter-spacing: 0.02em;
 }
-div[data-testid="stSidebar"] .stButton button:hover {
+div[data-testid="stSidebar"] .stButton button:hover,
+div[data-testid="stSidebar"] .stButton button:focus {
     border-color: var(--accent) !important;
     color: var(--accent) !important;
     background: rgba(0,212,170,0.06) !important;
 }
 
-/* Main run buttons */
+/* main CTA buttons */
 [data-testid="stMainBlockContainer"] .stButton button {
     background: var(--accent) !important;
     color: #000 !important;
     font-family: 'Space Mono', monospace !important;
-    font-size: 0.78rem !important;
+    font-size: 0.75rem !important;
     font-weight: 700 !important;
     border: none !important;
     border-radius: 3px !important;
-    padding: 0.55rem 1.5rem !important;
-    transition: opacity 0.2s !important;
+    padding: 0.5rem 1.4rem !important;
+    letter-spacing: 0.04em;
 }
-[data-testid="stMainBlockContainer"] .stButton button:hover { opacity: 0.85 !important; }
+[data-testid="stMainBlockContainer"] .stButton button:hover { opacity: 0.82 !important; }
 
-/* Inputs */
-input, .stTextInput input, .stNumberInput input, .stSelectbox select {
-    background-color: var(--surface2) !important;
+/* form inputs */
+input, textarea,
+.stTextInput input,
+.stNumberInput input {
+    background: var(--surf2) !important;
     border: 1px solid var(--border) !important;
     color: var(--text) !important;
     font-family: 'Space Mono', monospace !important;
-    font-size: 0.8rem !important;
+    font-size: 0.78rem !important;
     border-radius: 3px !important;
 }
-.stSelectbox > div > div {
-    background-color: var(--surface2) !important;
+.stSelectbox > div > div,
+.stMultiSelect > div > div {
+    background: var(--surf2) !important;
     border: 1px solid var(--border) !important;
     color: var(--text) !important;
 }
 
-/* Metric cards */
+/* metrics */
 [data-testid="stMetric"] {
-    background: var(--surface) !important;
+    background: var(--surf) !important;
     border: 1px solid var(--border) !important;
     border-radius: 6px !important;
     padding: 1rem !important;
 }
-[data-testid="stMetricLabel"] { color: var(--muted) !important; font-size: 0.72rem !important; font-family: 'Space Mono', monospace !important; text-transform: uppercase; letter-spacing: 0.08em; }
-[data-testid="stMetricValue"] { color: var(--text) !important; font-family: 'Space Mono', monospace !important; }
-[data-testid="stMetricDelta"] { font-family: 'Space Mono', monospace !important; }
+[data-testid="stMetricLabel"] {
+    color: var(--muted) !important;
+    font-size: 0.68rem !important;
+    font-family: 'Space Mono', monospace !important;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+[data-testid="stMetricValue"] {
+    color: var(--text) !important;
+    font-family: 'Space Mono', monospace !important;
+}
 
-/* Headers */
 h1, h2, h3 { font-family: 'Space Mono', monospace !important; }
-h1 { font-size: 1.4rem !important; letter-spacing: -0.02em; }
 
-/* Info/warning boxes */
-.stAlert { background: var(--surface2) !important; border-radius: 4px !important; border-left: 3px solid var(--accent) !important; }
-
-/* Section pill */
-.section-pill {
+.pill {
     display: inline-block;
-    background: rgba(0,212,170,0.12);
-    border: 1px solid rgba(0,212,170,0.3);
+    background: rgba(0,212,170,0.1);
+    border: 1px solid rgba(0,212,170,0.28);
     color: var(--accent);
     font-family: 'Space Mono', monospace;
-    font-size: 0.68rem;
+    font-size: 0.66rem;
     padding: 2px 10px;
     border-radius: 20px;
     letter-spacing: 0.12em;
     text-transform: uppercase;
-    margin-bottom: 8px;
+    margin-bottom: 6px;
 }
-.section-title {
+.page-title {
     font-family: 'Space Mono', monospace;
-    font-size: 1.35rem;
+    font-size: 1.3rem;
     font-weight: 700;
     color: var(--text);
-    margin-bottom: 4px;
+    margin-bottom: 2px;
 }
-.section-desc {
+.page-desc {
     font-family: 'DM Sans', sans-serif;
-    font-size: 0.88rem;
+    font-size: 0.85rem;
     color: var(--muted);
     margin-bottom: 1.5rem;
-    line-height: 1.6;
+    line-height: 1.65;
+    max-width: 780px;
 }
-.divider { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0; }
+hr.div { border: none; border-top: 1px solid var(--border); margin: 1.4rem 0; }
 
-/* Regime badge */
-.badge-bull   { color: #26a641; font-family: 'Space Mono', monospace; font-size: 0.75rem; }
-.badge-bear   { color: #da3633; font-family: 'Space Mono', monospace; font-size: 0.75rem; }
-.badge-sideways { color: #f7c948; font-family: 'Space Mono', monospace; font-size: 0.75rem; }
-
-/* Stats table */
-.stats-table { width: 100%; border-collapse: collapse; font-family: 'Space Mono', monospace; font-size: 0.78rem; }
-.stats-table th { color: var(--muted); border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left; font-weight: 400; text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.68rem; }
-.stats-table td { color: var(--text); padding: 6px 10px; border-bottom: 1px solid rgba(33,38,45,0.5); }
+.stats-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Space Mono', monospace;
+    font-size: 0.75rem;
+}
+.stats-table th {
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    padding: 5px 10px;
+    text-align: left;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.65rem;
+}
+.stats-table td {
+    color: var(--text);
+    padding: 5px 10px;
+    border-bottom: 1px solid rgba(33,38,45,0.45);
+}
 .stats-table tr:last-child td { border-bottom: none; }
-.pos { color: #26a641 !important; } .neg { color: #da3633 !important; }
+.pos { color: #26a641 !important; }
+.neg { color: #da3633 !important; }
+
+.placeholder {
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 3rem;
+    text-align: center;
+    margin-top: 1rem;
+    font-family: 'Space Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--muted);
+}
+
+/* slider label */
+[data-testid="stSlider"] label { font-family: 'Space Mono',monospace; font-size: 0.73rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SHARED PLOTLY THEME
+# ──────────────────────────────────────────────────────────────────────────────
+
+PLOT_LAYOUT = dict(
+    paper_bgcolor="#07090d",
+    plot_bgcolor="#07090d",
+    font=dict(family="Space Mono", color="#7d8590", size=10),
+    hovermode="x unified",
+    margin=dict(l=10, r=10, t=36, b=10),
+    legend=dict(
+        orientation="h", y=1.04, bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6edf3", size=10),
+    ),
+)
+
+def _style_axes(fig, rows=1, cols=1):
+    for r in range(1, rows + 1):
+        for c in range(1, cols + 1):
+            fig.update_xaxes(gridcolor="#161b22", showgrid=True, zeroline=False, row=r, col=c)
+            fig.update_yaxes(gridcolor="#161b22", showgrid=True, zeroline=False, row=r, col=c)
+    if hasattr(fig, "layout") and fig.layout.annotations:
+        fig.update_annotations(font=dict(family="Space Mono", color="#7d8590", size=9))
+    return fig
+
+
+def placeholder(hint: str) -> None:
+    st.markdown(
+        f'<div class="placeholder">{hint}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ──────────────────────────────────────────────────────────────────────────────
+
 with st.sidebar:
     st.markdown("""
-    <div style="font-family:'Space Mono',monospace; font-size:1.1rem; font-weight:700;
-         color:#00d4aa; letter-spacing:0.05em; padding:0.5rem 0 0.2rem;">
+    <div style="font-family:'Space Mono',monospace;font-size:1.05rem;font-weight:700;
+         color:#00d4aa;letter-spacing:0.06em;padding:0.4rem 0 0.15rem;">
     ⬡ QUANTLAB
     </div>
-    <div style="font-family:'DM Sans',sans-serif; font-size:0.72rem; color:#7d8590;
-         margin-bottom:1.5rem; letter-spacing:0.02em;">
+    <div style="font-family:'DM Sans',sans-serif;font-size:0.7rem;color:#7d8590;
+         margin-bottom:1.4rem;letter-spacing:0.02em;">
     Quantitative Research Terminal
     </div>
+    <div style="font-family:'Space Mono',monospace;font-size:0.6rem;color:#7d8590;
+         text-transform:uppercase;letter-spacing:0.12em;margin-bottom:6px;">Modules</div>
     """, unsafe_allow_html=True)
 
-    st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.65rem;color:#7d8590;text-transform:uppercase;letter-spacing:0.12em;margin-bottom:8px;'>Modules</div>", unsafe_allow_html=True)
-
-    pages = {
-        "01 · Market Regime Clustering":   "regime",
-        "02 · Pairs Trading":              "pairs",
-        "03 · Volatility Surface":         "vol_surface",
-        "04 · CVaR Optimisation":          "cvar",
+    PAGES = {
+        "01 · Market Regime":    "regime",
+        "02 · Pairs Trading":   "pairs",
+        "03 · Vol Surface":     "vol_surface",
+        "04 · CVaR Optimise":   "cvar",
     }
 
     if "page" not in st.session_state:
         st.session_state.page = "regime"
 
-    for label, key in pages.items():
+    for label, key in PAGES.items():
         if st.button(label, key=f"nav_{key}"):
             st.session_state.page = key
 
-    st.markdown("<hr style='border-color:#21262d;margin:1.5rem 0 1rem;'>", unsafe_allow_html=True)
-    st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.6rem;color:#7d8590;line-height:1.8;'>Data via yfinance<br>Models: hmmlearn · statsmodels<br>Solver: CVXPY · SCS<br>Vis: Plotly</div>", unsafe_allow_html=True)
+    st.markdown("<hr style='border-color:#21262d;margin:1.4rem 0 1rem;'>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='font-family:Space Mono,monospace;font-size:0.58rem;color:#7d8590;line-height:1.9;'>"
+        "Data · yfinance<br>Models · hmmlearn · statsmodels<br>"
+        "Solver · CVXPY / SCS<br>Vis · Plotly</div>",
+        unsafe_allow_html=True,
+    )
+
 
 page = st.session_state.page
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MODULE 1 — MARKET REGIME CLUSTERING
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+
 if page == "regime":
-    st.markdown('<div class="section-pill">Module 01</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Market Regime Clustering</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-desc">Uses a Gaussian Hidden Markov Model trained on rolling returns and realised volatility to detect latent market states — Bull, Bear, or Sideways — for each trading day.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pill">Module 01</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-title">Market Regime Clustering</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-desc">Gaussian Hidden Markov Model trained on rolling returns and '
+        'realised volatility to detect latent market states — Bull, Bear, or Sideways — for each trading day.</div>',
+        unsafe_allow_html=True,
+    )
 
     col_cfg, col_out = st.columns([1, 2.8], gap="large")
 
     with col_cfg:
         st.markdown("**Configuration**")
-        ticker_hmm   = ticker_selectbox("Ticker", "SPY", key="hmm_tick")
-        period_hmm   = st.selectbox("History", ["2y","3y","5y","10y"], index=2, key="hmm_per")
-        n_states_hmm = st.selectbox("HMM States", [2, 3, 4], index=1, key="hmm_st")
+        ticker_hmm   = ticker_select("Ticker", "SPY", key="hmm_tick")
+        period_hmm   = st.selectbox("History", ["2y", "3y", "5y", "10y"], index=2, key="hmm_per")
+        n_states     = st.selectbox("HMM States", [2, 3, 4], index=1, key="hmm_st")
         roll_win     = st.slider("Rolling Window (days)", 5, 30, 10, key="hmm_roll")
-        n_iter_hmm   = st.slider("EM Iterations", 50, 300, 150, key="hmm_iter")
-        run_hmm      = st.button("Run HMM", key="run_hmm")
+        n_iter       = st.slider("EM Iterations", 50, 300, 150, key="hmm_iter")
+        run_hmm      = st.button("Run HMM", key="btn_hmm")
 
     with col_out:
         if run_hmm:
@@ -378,338 +474,312 @@ if page == "regime":
                     log_ret  = np.log(close / close.shift(1)).dropna()
                     roll_ret = log_ret.rolling(roll_win).mean()
                     roll_vol = log_ret.rolling(roll_win).std()
-                    feat_df  = pd.DataFrame({"ret": roll_ret, "vol": roll_vol}).dropna()
+                    feats = pd.DataFrame({"ret": roll_ret, "vol": roll_vol}).dropna()
 
-                    X = feat_df.values
-                    scaler = StandardScaler()
-                    X_sc = scaler.fit_transform(X)
-
-                    model = GaussianHMM(n_components=n_states_hmm, covariance_type="full",
-                                        n_iter=n_iter_hmm, random_state=42)
+                    X_sc = StandardScaler().fit_transform(feats.values)
+                    model = GaussianHMM(
+                        n_components=n_states, covariance_type="full",
+                        n_iter=n_iter, random_state=42,
+                    )
                     model.fit(X_sc)
-                    hidden = model.predict(X_sc)
-                    feat_df["state"] = hidden
+                    states = model.predict(X_sc)
+                    feats["state"] = states
 
-                    # Map states to regime labels by mean return
-                    state_ret = feat_df.groupby("state")["ret"].mean().sort_values()
-                    if n_states_hmm == 2:
-                        label_map = {state_ret.index[0]: "Bear", state_ret.index[-1]: "Bull"}
-                    elif n_states_hmm == 3:
-                        label_map = {state_ret.index[0]: "Bear", state_ret.index[1]: "Sideways", state_ret.index[2]: "Bull"}
-                    else:
-                        keys = list(state_ret.index)
+                    # Map states → regime labels by mean return rank
+                    ranked = feats.groupby("state")["ret"].mean().sort_values()
+                    keys = list(ranked.index)
+                    if n_states == 2:
                         label_map = {keys[0]: "Bear", keys[-1]: "Bull"}
-                        for k in keys[1:-1]: label_map[k] = "Sideways"
-                    feat_df["regime"] = feat_df["state"].map(label_map)
+                    else:
+                        label_map = {keys[0]: "Bear", keys[-1]: "Bull"}
+                        for k in keys[1:-1]:
+                            label_map[k] = "Sideways"
+                    feats["regime"] = feats["state"].map(label_map)
 
-                    price_aligned = close.loc[feat_df.index]
-
+                    price = close.loc[feats.index]
                     COLORS = {"Bull": "#26a641", "Bear": "#da3633", "Sideways": "#f7c948"}
 
-                    # ── Chart ──────────────────────────────────────────
-                    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                                        row_heights=[0.55, 0.25, 0.2],
-                                        vertical_spacing=0.03)
+                    fig = make_subplots(
+                        rows=3, cols=1, shared_xaxes=True,
+                        row_heights=[0.55, 0.25, 0.2],
+                        vertical_spacing=0.025,
+                    )
 
-                    # Price line
-                    fig.add_trace(go.Scatter(x=price_aligned.index, y=price_aligned.values,
-                                             mode="lines", line=dict(color="#7d8590", width=1),
-                                             name="Price", showlegend=False), row=1, col=1)
+                    # Price
+                    fig.add_trace(go.Scatter(
+                        x=price.index, y=price.values,
+                        mode="lines", line=dict(color="#7d8590", width=1),
+                        name="Price", showlegend=False,
+                    ), row=1, col=1)
 
-                    # Shaded regimes on price
-                    regime_changes = feat_df["regime"].ne(feat_df["regime"].shift()).cumsum()
-                    for grp_id in regime_changes.unique():
-                        seg = feat_df[regime_changes == grp_id]
-                        regime_name = seg["regime"].iloc[0]
-                        color = COLORS.get(regime_name, "#555")
-                        x0, x1 = seg.index[0], seg.index[-1]
-                        fig.add_vrect(x0=x0, x1=x1,
-                                      fillcolor=color, opacity=0.18,
-                                      layer="below", line_width=0)
+                    # Shaded regime bands
+                    seg_id = feats["regime"].ne(feats["regime"].shift()).cumsum()
+                    for gid in seg_id.unique():
+                        seg = feats[seg_id == gid]
+                        fig.add_vrect(
+                            x0=seg.index[0], x1=seg.index[-1],
+                            fillcolor=COLORS.get(seg["regime"].iloc[0], "#555"),
+                            opacity=0.17, layer="below", line_width=0,
+                        )
 
                     # Regime dots
-                    for regime_name, color in COLORS.items():
-                        mask = feat_df["regime"] == regime_name
+                    for rname, col in COLORS.items():
+                        mask = feats["regime"] == rname
                         if mask.any():
                             fig.add_trace(go.Scatter(
-                                x=feat_df.index[mask],
-                                y=price_aligned[mask],
+                                x=feats.index[mask], y=price[mask],
                                 mode="markers",
-                                marker=dict(color=color, size=3, opacity=0.6),
-                                name=regime_name,
+                                marker=dict(color=col, size=3, opacity=0.55),
+                                name=rname,
                             ), row=1, col=1)
 
-                    # Rolling Vol
-                    fig.add_trace(go.Scatter(x=feat_df.index, y=feat_df["vol"] * np.sqrt(252),
-                                             mode="lines", line=dict(color="#f7c948", width=1.2),
-                                             name="Ann. Vol", showlegend=False), row=2, col=1)
+                    # Rolling vol
+                    fig.add_trace(go.Scatter(
+                        x=feats.index, y=feats["vol"] * np.sqrt(252),
+                        mode="lines", line=dict(color="#f7c948", width=1.2),
+                        name="Ann. Vol", showlegend=False,
+                    ), row=2, col=1)
 
-                    # Regime state bar
-                    state_colors = [COLORS.get(r, "#555") for r in feat_df["regime"]]
-                    fig.add_trace(go.Bar(x=feat_df.index, y=[1]*len(feat_df),
-                                         marker_color=state_colors, showlegend=False,
-                                         name="Regime"), row=3, col=1)
+                    # Regime colour bar
+                    state_cols = [COLORS.get(r, "#555") for r in feats["regime"]]
+                    fig.add_trace(go.Bar(
+                        x=feats.index, y=[1] * len(feats),
+                        marker_color=state_cols, showlegend=False, name="Regime",
+                    ), row=3, col=1)
 
                     fig.update_layout(
-                        paper_bgcolor="#080c10", plot_bgcolor="#080c10",
-                        font=dict(family="Space Mono", color="#7d8590", size=10),
-                        legend=dict(orientation="h", y=1.02, x=0,
-                                    bgcolor="rgba(0,0,0,0)",
+                        **PLOT_LAYOUT, height=560,
+                        legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
                                     font=dict(color="#e6edf3", size=10)),
-                        height=560, margin=dict(l=10, r=10, t=30, b=10),
-                        hovermode="x unified",
                     )
-                    for row in [1,2,3]:
-                        fig.update_xaxes(gridcolor="#161b22", showgrid=True,
-                                         zeroline=False, row=row, col=1)
-                        fig.update_yaxes(gridcolor="#161b22", showgrid=True,
-                                         zeroline=False, row=row, col=1)
-                    fig.update_yaxes(title_text="Price", row=1, col=1)
+                    _style_axes(fig, rows=3)
+                    fig.update_yaxes(title_text="Price",    row=1, col=1)
                     fig.update_yaxes(title_text="Ann. Vol", row=2, col=1)
-                    fig.update_yaxes(showticklabels=False, row=3, col=1)
+                    fig.update_yaxes(showticklabels=False,  row=3, col=1)
+                    st.plotly_chart(fig, use_container_width=True)
 
-                    st.plotly_chart(fig, width="stretch")
-
-                    # ── Stats ──────────────────────────────────────────
-                    st.markdown("<hr class='divider'>", unsafe_allow_html=True)
-                    cols_s = st.columns(len(COLORS))
-                    for i, (rname, color) in enumerate(COLORS.items()):
-                        mask = feat_df["regime"] == rname
+                    # Regime stat cards
+                    st.markdown("<hr class='div'>", unsafe_allow_html=True)
+                    stat_cols = st.columns(len(COLORS))
+                    for i, (rname, col) in enumerate(COLORS.items()):
+                        mask = feats["regime"] == rname
                         if not mask.any():
                             continue
-                        days = mask.sum()
-                        avg_ret = feat_df.loc[mask, "ret"].mean() * 252 * 100
-                        avg_vol = feat_df.loc[mask, "vol"].mean() * np.sqrt(252) * 100
-                        pct     = days / len(feat_df) * 100
-                        with cols_s[i]:
+                        days    = mask.sum()
+                        avg_ret = feats.loc[mask, "ret"].mean() * 252 * 100
+                        avg_vol = feats.loc[mask, "vol"].mean() * np.sqrt(252) * 100
+                        pct     = days / len(feats) * 100
+                        ret_col = "#26a641" if avg_ret > 0 else "#da3633"
+                        with stat_cols[i]:
                             st.markdown(f"""
-                            <div style="background:#0d1117;border:1px solid #21262d;border-top:2px solid {color};
-                                 border-radius:6px;padding:1rem;font-family:'Space Mono',monospace;">
-                                <div style="color:{color};font-size:0.7rem;text-transform:uppercase;
-                                     letter-spacing:0.1em;margin-bottom:0.5rem;">{rname}</div>
-                                <div style="color:#e6edf3;font-size:1.4rem;font-weight:700;">{pct:.0f}%</div>
-                                <div style="color:#7d8590;font-size:0.65rem;margin-top:4px;">of trading days</div>
-                                <hr style="border-color:#21262d;margin:0.6rem 0;">
-                                <div style="display:flex;justify-content:space-between;font-size:0.68rem;">
+                            <div style="background:#0d1117;border:1px solid #21262d;
+                                 border-top:2px solid {col};border-radius:6px;padding:1rem;
+                                 font-family:'Space Mono',monospace;">
+                                <div style="color:{col};font-size:0.67rem;text-transform:uppercase;
+                                     letter-spacing:0.1em;margin-bottom:0.45rem;">{rname}</div>
+                                <div style="color:#e6edf3;font-size:1.35rem;font-weight:700;">{pct:.0f}%</div>
+                                <div style="color:#7d8590;font-size:0.62rem;margin-top:3px;">of trading days</div>
+                                <hr style="border-color:#21262d;margin:0.55rem 0;">
+                                <div style="display:flex;justify-content:space-between;font-size:0.65rem;">
                                     <span style="color:#7d8590;">Ann. Ret</span>
-                                    <span style="color:{'#26a641' if avg_ret>0 else '#da3633'};">{avg_ret:+.1f}%</span>
+                                    <span style="color:{ret_col};">{avg_ret:+.1f}%</span>
                                 </div>
-                                <div style="display:flex;justify-content:space-between;font-size:0.68rem;margin-top:4px;">
+                                <div style="display:flex;justify-content:space-between;font-size:0.65rem;margin-top:3px;">
                                     <span style="color:#7d8590;">Ann. Vol</span>
                                     <span style="color:#e6edf3;">{avg_vol:.1f}%</span>
                                 </div>
                             </div>""", unsafe_allow_html=True)
 
-                    # Convergence note
-                    st.markdown(f"""<div style="margin-top:1rem;font-family:'Space Mono',monospace;
-                        font-size:0.68rem;color:#7d8590;">
-                        Model log-likelihood: <span style="color:#00d4aa;">{model.monitor_.history[-1]:.2f}</span>
-                        &nbsp;·&nbsp; Converged: <span style="color:{'#26a641' if model.monitor_.converged else '#da3633'};">
-                        {'Yes' if model.monitor_.converged else 'No'}</span>
-                        &nbsp;·&nbsp; States: {n_states_hmm} &nbsp;·&nbsp; Window: {roll_win}d
-                    </div>""", unsafe_allow_html=True)
+                    converged = model.monitor_.converged
+                    ll = model.monitor_.history[-1]
+                    st.markdown(
+                        f"<div style='margin-top:1rem;font-family:Space Mono,monospace;font-size:0.65rem;color:#7d8590;'>"
+                        f"Log-likelihood <span style='color:#00d4aa;'>{ll:.2f}</span> &nbsp;·&nbsp; "
+                        f"Converged <span style='color:{'#26a641' if converged else '#da3633'};'>"
+                        f"{'Yes' if converged else 'No'}</span> &nbsp;·&nbsp; "
+                        f"States {n_states} &nbsp;·&nbsp; Window {roll_win}d</div>",
+                        unsafe_allow_html=True,
+                    )
 
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
         else:
-            st.markdown("""
-            <div style="border:1px dashed #21262d;border-radius:8px;padding:3rem;text-align:center;margin-top:1rem;">
-                <div style="font-family:'Space Mono',monospace;font-size:0.75rem;color:#7d8590;">
-                    Configure parameters and click <strong style="color:#00d4aa;">Run HMM</strong> to detect market regimes
-                </div>
-            </div>""", unsafe_allow_html=True)
+            placeholder("Configure parameters and click <strong style='color:#00d4aa;'>Run HMM</strong> to detect market regimes")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MODULE 2 — PAIRS TRADING
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+
 elif page == "pairs":
-    st.markdown('<div class="section-pill">Module 02</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Statistical Pairs Trading</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-desc">Engle-Granger cointegration test identifies structurally linked assets. Deviations in the spread beyond a z-score threshold generate long/short signals that profit as the spread mean-reverts.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pill">Module 02</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-title">Statistical Pairs Trading</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-desc">Engle-Granger cointegration test identifies structurally linked assets. '
+        'Deviations in the spread beyond a z-score threshold generate long/short signals that profit as the spread mean-reverts.</div>',
+        unsafe_allow_html=True,
+    )
 
     col_cfg, col_out = st.columns([1, 2.8], gap="large")
 
     with col_cfg:
         st.markdown("**Configuration**")
-        tick1    = ticker_selectbox("Asset A", "KO",  key="p_t1")
-        tick2    = ticker_selectbox("Asset B", "PEP", key="p_t2")
-        period_p = st.selectbox("History", ["2y","3y","5y"], index=1, key="p_per")
-        zscore_entry = st.slider("Entry Z-Score", 1.0, 3.0, 2.0, 0.25, key="p_ze")
-        zscore_exit  = st.slider("Exit Z-Score",  0.0, 1.5, 0.5, 0.25, key="p_zx")
-        roll_z   = st.slider("Z-Score Window", 20, 120, 60, key="p_rz")
-        run_pairs = st.button("Run Backtest", key="run_pairs")
+        tick1        = ticker_select("Asset A", "KO",  key="p_t1")
+        tick2        = ticker_select("Asset B", "PEP", key="p_t2")
+        period_p     = st.selectbox("History", ["2y", "3y", "5y"], index=1, key="p_per")
+        z_entry      = st.slider("Entry |Z-Score|", 1.0, 3.0, 2.0, 0.25, key="p_ze")
+        z_exit       = st.slider("Exit |Z-Score|",  0.0, 1.5, 0.5, 0.25, key="p_zx")
+        roll_z       = st.slider("Rolling Window (days)", 20, 120, 60, key="p_rz")
+        run_pairs    = st.button("Run Backtest", key="btn_pairs")
 
     with col_out:
         if run_pairs:
             with st.spinner("Running pairs analysis…"):
                 try:
-                    from statsmodels.tsa.stattools import coint, adfuller
+                    from statsmodels.tsa.stattools import coint
                     from statsmodels.regression.linear_model import OLS
                     import statsmodels.api as sm
 
-                    raw = yf_download([tick1, tick2], period=period_p)["Close"]
-                    raw = raw.dropna()
-                    # yfinance returns columns in alphabetical order — remap explicitly
-                    available = list(raw.columns)
-                    requested = [tick1, tick2]
-                    # Build map: match available cols to requested tickers (case-insensitive)
+                    raw = yf_download([tick1, tick2], period=period_p)["Close"].dropna()
+
+                    # Align columns to requested tickers (yfinance may reorder)
                     col_map = {}
-                    for req in requested:
-                        for av in available:
+                    for req in [tick1, tick2]:
+                        for av in raw.columns:
                             if av.upper() == req.upper() and av not in col_map.values():
                                 col_map[av] = req
                                 break
                     raw = raw.rename(columns=col_map)
                     if tick1 not in raw.columns or tick2 not in raw.columns:
-                        st.error(f"Could not find both tickers in returned data. Got: {list(raw.columns)}")
+                        st.error(f"Tickers not found in data. Got: {list(raw.columns)}")
                         st.stop()
 
-                    # Cointegration test
-                    score, pvalue, _ = coint(raw[tick1], raw[tick2])
-
-                    # Hedge ratio via OLS
+                    _, pvalue, _ = coint(raw[tick1], raw[tick2])
                     X = sm.add_constant(raw[tick2])
                     res = OLS(raw[tick1], X).fit()
-                    hedge_ratio = res.params[tick2]
-                    spread = raw[tick1] - hedge_ratio * raw[tick2]
+                    hedge = res.params[tick2]
 
-                    # Rolling z-score
+                    spread    = raw[tick1] - hedge * raw[tick2]
                     roll_mean = spread.rolling(roll_z).mean()
                     roll_std  = spread.rolling(roll_z).std()
                     zscore    = (spread - roll_mean) / roll_std
 
-                    # Stateful signal: enter on threshold cross, exit when spread reverts
-                    # Uses NaN-then-ffill pattern so held positions carry forward correctly
-                    raw_signal = pd.Series(np.nan, index=raw.index)
-                    raw_signal[zscore >  zscore_entry] = -1   # short spread
-                    raw_signal[zscore < -zscore_entry] =  1   # long spread
-                    raw_signal[abs(zscore) <= zscore_exit] = 0  # explicit flat at reversion
-                    signal = raw_signal.ffill().fillna(0)        # carry position between signals
+                    # Stateful signal — ffill carries open position
+                    sig_raw = pd.Series(np.nan, index=raw.index)
+                    sig_raw[zscore >  z_entry] = -1
+                    sig_raw[zscore < -z_entry] =  1
+                    sig_raw[zscore.abs() <= z_exit] = 0
+                    signal = sig_raw.ffill().fillna(0)
 
-                    # Returns — computed at leg level to avoid divide-by-zero
-                    # when spread crosses zero, pct_change() produces nonsense
-                    ret_a      = raw[tick1].pct_change().fillna(0)
-                    ret_b      = raw[tick2].pct_change().fillna(0)
-                    spread_ret = ret_a - hedge_ratio * ret_b
-                    strat_ret  = signal.shift(1) * spread_ret
-                    cum_strat  = (1 + strat_ret).cumprod()
-                    cum_bh_a   = (1 + ret_a).cumprod()
-                    cum_bh_b   = (1 + ret_b).cumprod()
+                    ret_a   = raw[tick1].pct_change().fillna(0)
+                    ret_b   = raw[tick2].pct_change().fillna(0)
+                    sp_ret  = ret_a - hedge * ret_b
+                    st_ret  = signal.shift(1) * sp_ret
+                    cum_st  = (1 + st_ret).cumprod()
+                    cum_a   = (1 + ret_a).cumprod()
+                    cum_b   = (1 + ret_b).cumprod()
 
-                    sharpe = (strat_ret.mean() / strat_ret.std() * np.sqrt(252)) if strat_ret.std() > 0 else 0
-                    total_ret = (cum_strat.iloc[-1] - 1) * 100
-                    max_dd = ((cum_strat / cum_strat.cummax()) - 1).min() * 100
-                    n_trades = (signal.diff() != 0).sum()
+                    sharpe    = (st_ret.mean() / st_ret.std() * np.sqrt(252)) if st_ret.std() > 0 else 0
+                    tot_ret   = (cum_st.iloc[-1] - 1) * 100
+                    max_dd    = ((cum_st / cum_st.cummax()) - 1).min() * 100
+                    n_trades  = int((signal.diff() != 0).sum())
 
-                    # ── Charts ─────────────────────────────────────────
-                    fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
-                                        row_heights=[0.3, 0.22, 0.28, 0.2],
-                                        vertical_spacing=0.025,
-                                        subplot_titles=["Normalised Prices", "Spread", "Z-Score + Signals", "Cumulative P&L"])
+                    fig = make_subplots(
+                        rows=4, cols=1, shared_xaxes=True,
+                        row_heights=[0.3, 0.22, 0.28, 0.2],
+                        vertical_spacing=0.024,
+                        subplot_titles=["Normalised Prices", "Spread", "Z-Score", "Cumulative P&L"],
+                    )
 
-                    # Normalised prices
                     for t, col in [(tick1, "#00d4aa"), (tick2, "#f7c948")]:
-                        norm_price = raw[t] / raw[t].iloc[0]
-                        fig.add_trace(go.Scatter(x=raw.index, y=norm_price, mode="lines",
-                                                 line=dict(color=col, width=1.4), name=t), row=1, col=1)
+                        fig.add_trace(go.Scatter(
+                            x=raw.index, y=raw[t] / raw[t].iloc[0],
+                            mode="lines", line=dict(color=col, width=1.4), name=t,
+                        ), row=1, col=1)
 
-                    # Spread
                     fig.add_trace(go.Scatter(x=spread.index, y=spread, mode="lines",
-                                             line=dict(color="#7d8590", width=1), name="Spread",
-                                             showlegend=False), row=2, col=1)
+                        line=dict(color="#7d8590", width=1), showlegend=False, name="Spread"), row=2, col=1)
                     fig.add_trace(go.Scatter(x=roll_mean.index, y=roll_mean, mode="lines",
-                                             line=dict(color="#00d4aa", width=1, dash="dash"),
-                                             name="Mean", showlegend=False), row=2, col=1)
+                        line=dict(color="#00d4aa", width=1, dash="dash"), showlegend=False, name="Mean"), row=2, col=1)
 
-                    # Z-score
                     fig.add_trace(go.Scatter(x=zscore.index, y=zscore, mode="lines",
-                                             line=dict(color="#e6edf3", width=1), name="Z-Score",
-                                             showlegend=False), row=3, col=1)
-                    for lvl, col, dash in [(zscore_entry,"#26a641","dash"),
-                                           (-zscore_entry,"#da3633","dash"),
-                                           (zscore_exit,"#7d8590","dot"),
-                                           (-zscore_exit,"#7d8590","dot"),
-                                           (0,"#7d8590","solid")]:
-                        fig.add_hline(y=lvl, line_color=col, line_dash=dash,
-                                      line_width=0.8, row=3, col=1)
+                        line=dict(color="#e6edf3", width=1), showlegend=False, name="Z"), row=3, col=1)
+                    for lvl, col, dash in [
+                        (z_entry, "#26a641", "dash"), (-z_entry, "#da3633", "dash"),
+                        (z_exit, "#7d8590", "dot"),   (-z_exit, "#7d8590", "dot"),
+                        (0, "#7d8590", "solid"),
+                    ]:
+                        fig.add_hline(y=lvl, line_color=col, line_dash=dash, line_width=0.8, row=3, col=1)
 
-                    # Entry markers
-                    long_entry  = zscore[zscore < -zscore_entry]
-                    short_entry = zscore[zscore >  zscore_entry]
-                    fig.add_trace(go.Scatter(x=long_entry.index,  y=long_entry,  mode="markers",
-                                             marker=dict(color="#26a641", size=5, symbol="triangle-up"),
-                                             name="Long", showlegend=False), row=3, col=1)
-                    fig.add_trace(go.Scatter(x=short_entry.index, y=short_entry, mode="markers",
-                                             marker=dict(color="#da3633", size=5, symbol="triangle-down"),
-                                             name="Short", showlegend=False), row=3, col=1)
+                    long_idx  = zscore[zscore < -z_entry]
+                    short_idx = zscore[zscore >  z_entry]
+                    fig.add_trace(go.Scatter(x=long_idx.index, y=long_idx, mode="markers",
+                        marker=dict(color="#26a641", size=5, symbol="triangle-up"),
+                        showlegend=False, name="Long"), row=3, col=1)
+                    fig.add_trace(go.Scatter(x=short_idx.index, y=short_idx, mode="markers",
+                        marker=dict(color="#da3633", size=5, symbol="triangle-down"),
+                        showlegend=False, name="Short"), row=3, col=1)
 
-                    # P&L
-                    fig.add_trace(go.Scatter(x=cum_strat.index, y=cum_strat, mode="lines",
-                                             line=dict(color="#00d4aa", width=2), name="Strategy",
-                                             showlegend=False), row=4, col=1)
-                    fig.add_trace(go.Scatter(x=cum_bh_a.index, y=cum_bh_a, mode="lines",
-                                             line=dict(color="#7d8590", width=1, dash="dot"),
-                                             name=tick1, showlegend=False), row=4, col=1)
-                    fig.add_trace(go.Scatter(x=cum_bh_b.index, y=cum_bh_b, mode="lines",
-                                             line=dict(color="#444", width=1, dash="dot"),
-                                             name=tick2, showlegend=False), row=4, col=1)
+                    fig.add_trace(go.Scatter(x=cum_st.index, y=cum_st, mode="lines",
+                        line=dict(color="#00d4aa", width=2), showlegend=False, name="Strategy"), row=4, col=1)
+                    fig.add_trace(go.Scatter(x=cum_a.index, y=cum_a, mode="lines",
+                        line=dict(color="#7d8590", width=1, dash="dot"), showlegend=False, name=tick1), row=4, col=1)
+                    fig.add_trace(go.Scatter(x=cum_b.index, y=cum_b, mode="lines",
+                        line=dict(color="#444", width=1, dash="dot"), showlegend=False, name=tick2), row=4, col=1)
                     fig.add_hline(y=1, line_color="#21262d", line_width=0.8, row=4, col=1)
 
-                    fig.update_layout(
-                        paper_bgcolor="#080c10", plot_bgcolor="#080c10",
-                        font=dict(family="Space Mono", color="#7d8590", size=10),
-                        legend=dict(orientation="h", y=1.01, bgcolor="rgba(0,0,0,0)",
-                                    font=dict(color="#e6edf3", size=10)),
-                        height=640, margin=dict(l=10, r=10, t=30, b=10),
-                    )
-                    for i in range(1,5):
-                        fig.update_xaxes(gridcolor="#161b22", showgrid=True, zeroline=False, row=i, col=1)
-                        fig.update_yaxes(gridcolor="#161b22", showgrid=True, zeroline=False, row=i, col=1)
-                    fig.update_annotations(font=dict(family="Space Mono", color="#7d8590", size=9))
+                    fig.update_layout(**PLOT_LAYOUT, height=640,
+                        legend=dict(orientation="h", y=1.03, bgcolor="rgba(0,0,0,0)",
+                                    font=dict(color="#e6edf3", size=10)))
+                    _style_axes(fig, rows=4)
+                    st.plotly_chart(fig, use_container_width=True)
 
-                    st.plotly_chart(fig, width="stretch")
-
-                    # ── Stats ──────────────────────────────────────────
-                    st.markdown("<hr class='divider'>", unsafe_allow_html=True)
-                    coint_color = "#26a641" if pvalue < 0.05 else "#da3633"
-                    coint_label = "Cointegrated ✓" if pvalue < 0.05 else "Not Cointegrated ✗"
+                    st.markdown("<hr class='div'>", unsafe_allow_html=True)
+                    coint_ok  = pvalue < 0.05
+                    coint_col = "#26a641" if coint_ok else "#da3633"
+                    coint_lbl = "Cointegrated ✓" if coint_ok else "Not Cointegrated ✗"
 
                     m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Coint. p-value", f"{pvalue:.4f}", delta=coint_label)
-                    m2.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
-                    m3.metric("Total Return", f"{total_ret:+.1f}%")
-                    m4.metric("Sharpe Ratio", f"{sharpe:.2f}")
-                    m5.metric("Max Drawdown", f"{max_dd:.1f}%")
-                    st.caption(f"Trades executed: {n_trades}  ·  Entry |Z| > {zscore_entry}  ·  Exit |Z| < {zscore_exit}  ·  Window: {roll_z}d")
+                    m1.metric("Coint. p-value", f"{pvalue:.4f}", delta=coint_lbl)
+                    m2.metric("Hedge Ratio",    f"{hedge:.4f}")
+                    m3.metric("Total Return",   f"{tot_ret:+.1f}%")
+                    m4.metric("Sharpe Ratio",   f"{sharpe:.2f}")
+                    m5.metric("Max Drawdown",   f"{max_dd:.1f}%")
+                    st.caption(
+                        f"Trades: {n_trades}  ·  Entry |Z| > {z_entry}  ·  "
+                        f"Exit |Z| < {z_exit}  ·  Window: {roll_z}d"
+                    )
 
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
+                    import traceback; st.code(traceback.format_exc())
         else:
-            st.markdown("""
-            <div style="border:1px dashed #21262d;border-radius:8px;padding:3rem;text-align:center;margin-top:1rem;">
-                <div style="font-family:'Space Mono',monospace;font-size:0.75rem;color:#7d8590;">
-                    Set your pair and parameters, then click <strong style="color:#00d4aa;">Run Backtest</strong>
-                </div>
-            </div>""", unsafe_allow_html=True)
+            placeholder("Set your pair and parameters, then click <strong style='color:#00d4aa;'>Run Backtest</strong>")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MODULE 3 — VOLATILITY SURFACE
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 3 — IMPLIED VOLATILITY SURFACE
+# ══════════════════════════════════════════════════════════════════════════════
+
 elif page == "vol_surface":
-    st.markdown('<div class="section-pill">Module 03</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Implied Volatility Surface</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-desc">Fetches live options chain data, inverts Black-Scholes analytically for each strike & expiry, and renders the full IV surface in 3D — revealing the volatility smile and term structure.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pill">Module 03</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-title">Implied Volatility Surface</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-desc">Fetches live options chains, inverts Black-Scholes analytically for each strike '
+        '& expiry, and renders the full IV surface in 3D — revealing the volatility smile and term structure.</div>',
+        unsafe_allow_html=True,
+    )
 
     col_cfg, col_out = st.columns([1, 2.8], gap="large")
 
     with col_cfg:
         st.markdown("**Configuration**")
-        ticker_vs   = ticker_selectbox("Ticker (options-liquid)", "SPY", key="vs_tick")
+        ticker_vs   = ticker_select("Ticker (options-liquid)", "SPY", key="vs_tick")
         rf_rate     = st.number_input("Risk-Free Rate (%)", value=5.0, step=0.25, key="vs_rf") / 100
         min_oi      = st.number_input("Min Open Interest", value=100, step=50, key="vs_oi")
-        colorscale  = st.selectbox("Colorscale", ["Viridis","Plasma","Turbo","RdYlGn"], index=1, key="vs_cs")
-        option_type = st.selectbox("Option Type", ["calls", "puts", "both"], index=0, key="vs_ot")
-        run_vs      = st.button("Build Surface", key="run_vs")
+        colorscale  = st.selectbox("Colorscale", ["Plasma", "Viridis", "Turbo", "RdYlGn"], key="vs_cs")
+        opt_type    = st.selectbox("Option Type", ["calls", "puts", "both"], key="vs_ot")
+        run_vs      = st.button("Build Surface", key="btn_vs")
 
     with col_out:
         if run_vs:
@@ -717,17 +787,16 @@ elif page == "vol_surface":
                 try:
                     from scipy.optimize import brentq
                     from scipy.stats import norm
-                    import datetime as dt
+                    from scipy.interpolate import griddata
 
                     def bs_price(S, K, T, r, sigma, flag="c"):
                         if T <= 0 or sigma <= 0:
                             return max(S - K, 0) if flag == "c" else max(K - S, 0)
-                        d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
-                        d2 = d1 - sigma*np.sqrt(T)
+                        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+                        d2 = d1 - sigma * np.sqrt(T)
                         if flag == "c":
-                            return S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
-                        else:
-                            return K*np.exp(-r*T)*norm.cdf(-d2) - S*norm.cdf(-d1)
+                            return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+                        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
                     def implied_vol(price, S, K, T, r, flag="c"):
                         if T <= 1e-6:
@@ -736,376 +805,396 @@ elif page == "vol_surface":
                         if price <= intrinsic + 1e-6:
                             return np.nan
                         try:
-                            return brentq(lambda s: bs_price(S, K, T, r, s, flag) - price,
-                                          1e-6, 10.0, maxiter=200, xtol=1e-6)
+                            return brentq(
+                                lambda s: bs_price(S, K, T, r, s, flag) - price,
+                                1e-6, 10.0, maxiter=200, xtol=1e-6,
+                            )
                         except Exception:
                             return np.nan
 
                     spot = yf_spot(ticker_vs)
                     if not spot:
-                        st.error("Could not fetch spot price — check ticker."); st.stop()
+                        st.error("Could not fetch spot price — check ticker.")
+                        st.stop()
 
-                    exps = yf_ticker_options(ticker_vs)
+                    exps = yf_options_expiries(ticker_vs)
                     if not exps:
-                        st.error("No options data available for this ticker."); st.stop()
+                        st.error("No options data for this ticker.")
+                        st.stop()
 
                     today = dt.date.today()
+                    flags = (
+                        ["calls"] if opt_type == "calls" else
+                        ["puts"]  if opt_type == "puts"  else
+                        ["calls", "puts"]
+                    )
                     records = []
-                    flags_to_use = ["calls"] if option_type == "calls" else \
-                                   ["puts"]  if option_type == "puts"  else ["calls","puts"]
+                    prog = st.progress(0, text="Loading expiries…")
 
-                    progress = st.progress(0, text="Loading expiries…")
                     for idx, exp in enumerate(exps):
-                        progress.progress((idx+1)/len(exps), text=f"Expiry {exp}…")
-                        calls_df, puts_df = yf_option_chain_dfs(ticker_vs, exp)
+                        prog.progress((idx + 1) / len(exps), text=f"Expiry {exp}…")
+                        calls_df, puts_df = yf_option_chain(ticker_vs, exp)
                         if calls_df is None:
                             continue
-                        chain_map = {"calls": calls_df, "puts": puts_df}
                         exp_date = dt.datetime.strptime(exp, "%Y-%m-%d").date()
                         T = (exp_date - today).days / 365.0
                         if T <= 0:
                             continue
-                        for flag in flags_to_use:
-                            df_opt = chain_map[flag]
-                            df_opt["openInterest"] = pd.to_numeric(df_opt["openInterest"], errors="coerce").fillna(0)
-                            df_opt = df_opt[df_opt["openInterest"] >= min_oi].copy()
+                        chain_map = {"calls": calls_df, "puts": puts_df}
+                        for flag in flags:
+                            df_opt = chain_map[flag].copy()
+                            df_opt["openInterest"] = pd.to_numeric(
+                                df_opt["openInterest"], errors="coerce"
+                            ).fillna(0)
+                            df_opt = df_opt[df_opt["openInterest"] >= min_oi]
                             for _, row in df_opt.iterrows():
                                 bid = row.get("bid") or 0
                                 ask = row.get("ask") or 0
-                                mid = (bid + ask) / 2.0
-                                if mid <= 0:
-                                    mid = float(row.get("lastPrice") or 0)
+                                mid = (bid + ask) / 2 or float(row.get("lastPrice") or 0)
                                 if mid <= 0:
                                     continue
                                 K = float(row["strike"])
-                                if K <= 0 or K < spot * 0.5 or K > spot * 2.0:
+                                if K <= 0 or not (spot * 0.5 < K < spot * 2.0):
                                     continue
-                                iv = implied_vol(mid, spot, K, T, rf_rate, "c" if flag=="calls" else "p")
+                                iv = implied_vol(mid, spot, K, T, rf_rate, "c" if flag == "calls" else "p")
                                 if iv and 0.01 < iv < 5.0:
-                                    records.append({"strike": K, "T": T, "iv": iv*100,
-                                                    "expiry": exp, "type": flag,
-                                                    "moneyness": K/spot})
-                    progress.empty()
+                                    records.append({
+                                        "strike": K, "T": T, "iv": iv * 100,
+                                        "expiry": exp, "type": flag, "moneyness": K / spot,
+                                    })
+                    prog.empty()
 
                     if not records:
-                        st.error("No valid IV data computed. Try different filters or a more liquid ticker.")
+                        st.error("No valid IV computed. Try lower min-OI or a more liquid ticker.")
                         st.stop()
 
                     iv_df = pd.DataFrame(records)
                     iv_df = iv_df[(iv_df["iv"] > 1) & (iv_df["iv"] < 150)]
 
-                    # ── 3D Surface ─────────────────────────────────────
-                    # Pivot to grid for surface
-                    from scipy.interpolate import griddata
-
+                    # Interpolate to grid for 3-D surface
                     xi = np.linspace(iv_df["moneyness"].min(), iv_df["moneyness"].max(), 60)
                     yi = np.linspace(iv_df["T"].min(), iv_df["T"].max(), 40)
                     xi_g, yi_g = np.meshgrid(xi, yi)
-                    zi_g = griddata((iv_df["moneyness"], iv_df["T"]), iv_df["iv"],
-                                    (xi_g, yi_g), method="linear")
+                    zi_g = griddata(
+                        (iv_df["moneyness"], iv_df["T"]), iv_df["iv"],
+                        (xi_g, yi_g), method="linear",
+                    )
 
                     surf = go.Surface(
-                        x=xi_g, y=yi_g*365, z=zi_g,
-                        colorscale=colorscale,
-                        showscale=True,
-                        opacity=0.92,
-                        contours=dict(
-                            z=dict(show=True, usecolormap=True, highlightcolor="white", project_z=True)
-                        ),
+                        x=xi_g, y=yi_g * 365, z=zi_g,
+                        colorscale=colorscale, opacity=0.92, showscale=True,
+                        contours=dict(z=dict(show=True, usecolormap=True, project_z=True)),
                         colorbar=dict(
                             title=dict(text="IV (%)", font=dict(family="Space Mono", size=10)),
                             tickfont=dict(family="Space Mono", size=9),
-                            len=0.6, thickness=12)
+                            len=0.6, thickness=12,
+                        ),
                     )
-
                     scatter = go.Scatter3d(
-                        x=iv_df["moneyness"], y=iv_df["T"]*365, z=iv_df["iv"],
+                        x=iv_df["moneyness"], y=iv_df["T"] * 365, z=iv_df["iv"],
                         mode="markers",
-                        marker=dict(size=2, color=iv_df["iv"], colorscale=colorscale,
-                                    opacity=0.4),
-                        showlegend=False, name="Data pts"
+                        marker=dict(size=2, color=iv_df["iv"], colorscale=colorscale, opacity=0.4),
+                        showlegend=False, name="Data pts",
                     )
 
                     fig = go.Figure(data=[surf, scatter])
+                    ax_style = dict(gridcolor="#21262d", backgroundcolor="#0d1117")
                     fig.update_layout(
-                        paper_bgcolor="#080c10",
+                        paper_bgcolor="#07090d",
                         scene=dict(
                             bgcolor="#0d1117",
-                            xaxis=dict(title=dict(text="Moneyness (K/S)", font=dict(family="Space Mono",size=10)),
-                                       gridcolor="#21262d", backgroundcolor="#0d1117"),
-                            yaxis=dict(title=dict(text="Days to Expiry", font=dict(family="Space Mono",size=10)),
-                                       gridcolor="#21262d", backgroundcolor="#0d1117"),
-                            zaxis=dict(title=dict(text="Implied Vol (%)", font=dict(family="Space Mono",size=10)),
-                                       gridcolor="#21262d", backgroundcolor="#0d1117"),
+                            xaxis=dict(title=dict(text="Moneyness (K/S)", font=dict(family="Space Mono", size=10)), **ax_style),
+                            yaxis=dict(title=dict(text="Days to Expiry",  font=dict(family="Space Mono", size=10)), **ax_style),
+                            zaxis=dict(title=dict(text="Implied Vol (%)",  font=dict(family="Space Mono", size=10)), **ax_style),
                         ),
                         font=dict(family="Space Mono", color="#7d8590", size=9),
-                        height=600, margin=dict(l=0, r=0, t=30, b=0),
-                        title=dict(text=f"IV Surface · {ticker_vs} · Spot ${spot:.2f}",
-                                   font=dict(family="Space Mono", color="#e6edf3", size=12)),
+                        height=600, margin=dict(l=0, r=0, t=36, b=0),
+                        title=dict(
+                            text=f"IV Surface · {ticker_vs} · Spot ${spot:.2f}",
+                            font=dict(family="Space Mono", color="#e6edf3", size=12),
+                        ),
                     )
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
 
-                    # ── Smile cross-sections ───────────────────────────
-                    st.markdown("<hr class='divider'>", unsafe_allow_html=True)
-                    st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.75rem;color:#7d8590;margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.1em;'>Volatility Smile — Nearest 3 Expiries</div>", unsafe_allow_html=True)
-
+                    # Smile cross-sections
+                    st.markdown("<hr class='div'>", unsafe_allow_html=True)
+                    st.markdown(
+                        "<div style='font-family:Space Mono,monospace;font-size:0.72rem;color:#7d8590;"
+                        "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.1em;'>"
+                        "Volatility Smile — Nearest Expiries</div>",
+                        unsafe_allow_html=True,
+                    )
+                    smile_colors = ["#00d4aa", "#f7c948", "#ff6b6b", "#a78bfa", "#60a5fa"]
                     smile_fig = go.Figure()
-                    colors_sm = ["#00d4aa","#f7c948","#ff6b6b","#a78bfa","#60a5fa"]
-                    near_exps = sorted(iv_df["expiry"].unique())[:5]
-                    for i, exp in enumerate(near_exps):
+                    for i, exp in enumerate(sorted(iv_df["expiry"].unique())[:5]):
                         sub = iv_df[iv_df["expiry"] == exp].sort_values("moneyness")
                         smile_fig.add_trace(go.Scatter(
-                            x=sub["moneyness"], y=sub["iv"], mode="lines+markers",
-                            line=dict(color=colors_sm[i%len(colors_sm)], width=1.5),
-                            marker=dict(size=4), name=exp
+                            x=sub["moneyness"], y=sub["iv"],
+                            mode="lines+markers",
+                            line=dict(color=smile_colors[i % len(smile_colors)], width=1.5),
+                            marker=dict(size=4), name=exp,
                         ))
                     smile_fig.add_vline(x=1.0, line_color="#7d8590", line_dash="dot", line_width=0.8)
                     smile_fig.update_layout(
-                        paper_bgcolor="#080c10", plot_bgcolor="#080c10",
-                        font=dict(family="Space Mono", color="#7d8590", size=10),
+                        **PLOT_LAYOUT, height=300,
                         xaxis=dict(title="Moneyness", gridcolor="#161b22"),
-                        yaxis=dict(title="IV (%)", gridcolor="#161b22"),
-                        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#e6edf3",size=10)),
-                        height=300, margin=dict(l=10, r=10, t=10, b=10)
+                        yaxis=dict(title="IV (%)",    gridcolor="#161b22"),
                     )
-                    st.plotly_chart(smile_fig, width="stretch")
+                    st.plotly_chart(smile_fig, use_container_width=True)
 
-                    # Stats
+                    atm_iv = iv_df.loc[(iv_df["moneyness"] - 1).abs().idxmin(), "iv"]
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("ATM IV (nearest)", f"{iv_df.loc[(iv_df['moneyness']-1).abs().idxmin(),'iv']:.1f}%")
-                    m2.metric("Data Points", len(iv_df))
-                    m3.metric("Expiries", iv_df['expiry'].nunique())
-                    m4.metric("Spot Price", f"${spot:.2f}")
+                    m1.metric("ATM IV (nearest)", f"{atm_iv:.1f}%")
+                    m2.metric("Data Points",      len(iv_df))
+                    m3.metric("Expiries",          iv_df["expiry"].nunique())
+                    m4.metric("Spot Price",        f"${spot:.2f}")
 
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
                     import traceback; st.code(traceback.format_exc())
         else:
-            st.markdown("""
-            <div style="border:1px dashed #21262d;border-radius:8px;padding:3rem;text-align:center;margin-top:1rem;">
-                <div style="font-family:'Space Mono',monospace;font-size:0.75rem;color:#7d8590;">
-                    Click <strong style="color:#00d4aa;">Build Surface</strong> to compute the implied volatility surface.<br>
-                    <span style="font-size:0.65rem;">Best with liquid underlyings: SPY, QQQ, AAPL, TSLA, AMZN</span>
-                </div>
-            </div>""", unsafe_allow_html=True)
+            placeholder(
+                "Click <strong style='color:#00d4aa;'>Build Surface</strong> to compute the IV surface.<br>"
+                "<span style='font-size:0.62rem;'>Best with liquid underlyings: SPY · QQQ · AAPL · TSLA</span>"
+            )
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MODULE 4 — CVaR PORTFOLIO OPTIMISATION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+
 elif page == "cvar":
-    st.markdown('<div class="section-pill">Module 04</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">CVaR Portfolio Optimisation</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-desc">Minimises Conditional Value-at-Risk (Expected Shortfall) — the average loss in the worst α% of scenarios — using convex optimisation via CVXPY. Compared against equal-weight and max-Sharpe portfolios.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pill">Module 04</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-title">CVaR Portfolio Optimisation</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="page-desc">Minimises Conditional Value-at-Risk (Expected Shortfall) — the average loss '
+        'in the worst α% of scenarios — via convex optimisation (CVXPY/SCS). '
+        'Compared against equal-weight and max-Sharpe benchmarks.</div>',
+        unsafe_allow_html=True,
+    )
 
     col_cfg, col_out = st.columns([1, 2.8], gap="large")
 
+    _CVAR_DEFAULTS = ["AAPL", "MSFT", "GOOGL", "AMZN", "JPM", "GS", "XOM", "JNJ"]
+    _CVAR_DEF_LABELS = [
+        lbl for lbl in _TICKER_LABELS
+        if lbl.split(" — ")[0].strip() in _CVAR_DEFAULTS
+    ]
+
     with col_cfg:
         st.markdown("**Configuration**")
-        _cvar_defaults = ["AAPL","MSFT","GOOGL","AMZN","JPM","GS","XOM","JNJ"]
-        _cvar_default_labels = [
-            lbl for lbl in _ticker_labels
-            if lbl.split(" — ")[0].strip() in _cvar_defaults
-        ]
-        tickers_cvar_sel = st.multiselect(
+        tickers_sel = st.multiselect(
             "Tickers (search & select)",
-            options=_ticker_labels,
-            default=_cvar_default_labels,
+            options=_TICKER_LABELS,
+            default=_CVAR_DEF_LABELS,
             key="cv_ticks",
-            help="Type to search across all US-listed stocks"
+            help="Type to search all US-listed stocks",
         )
-        period_cv    = st.selectbox("History", ["2y","3y","5y"], index=1, key="cv_per")
-        alpha_cv     = st.slider("CVaR Confidence Level α", 0.90, 0.99, 0.95, 0.01, key="cv_a",
-                                  help="Minimise expected loss in worst (1-α)% of days")
-        max_weight   = st.slider("Max Weight per Asset (%)", 10, 60, 40, 5, key="cv_mw") / 100
-        run_cvar     = st.button("Optimise Portfolio", key="run_cvar")
+        period_cv   = st.selectbox("History", ["2y", "3y", "5y"], index=1, key="cv_per")
+        alpha_cv    = st.slider("CVaR Confidence α", 0.90, 0.99, 0.95, 0.01, key="cv_a",
+                                help="Minimise expected loss in worst (1-α)% of days")
+        max_wt      = st.slider("Max Weight per Asset (%)", 10, 60, 40, 5, key="cv_mw") / 100
+        run_cvar    = st.button("Optimise Portfolio", key="btn_cvar")
 
     with col_out:
         if run_cvar:
             with st.spinner("Fetching data & solving CVaR optimisation…"):
                 try:
                     import cvxpy as cp
+                    from scipy.optimize import minimize as sp_minimize
 
-                    tlist = [lbl.split(" — ")[0].strip() for lbl in tickers_cvar_sel]
-                    tlist = [t for t in tlist if t]
+                    tlist = [lbl.split(" — ")[0].strip() for lbl in tickers_sel if lbl]
                     if len(tlist) < 2:
-                        st.error("Enter at least 2 tickers."); st.stop()
+                        st.error("Select at least 2 tickers.")
+                        st.stop()
 
                     raw = yf_download(tlist, period=period_cv)["Close"]
                     if isinstance(raw, pd.Series):
                         raw = raw.to_frame()
-                    raw = raw.dropna(axis=1, how="all").dropna()
+                    raw   = raw.dropna(axis=1, how="all").dropna()
                     tlist = list(raw.columns)
-                    n = len(tlist)
+                    n     = len(tlist)
                     if n < 2:
-                        st.error("Insufficient data for selected tickers."); st.stop()
+                        st.error("Insufficient data for selected tickers.")
+                        st.stop()
 
-                    rets = raw.pct_change().dropna().values  # (T, n)
-                    T, n = rets.shape
+                    rets    = raw.pct_change().dropna().values   # (T, n)
+                    T_rows  = rets.shape[0]
+                    k       = int(np.ceil((1 - alpha_cv) * T_rows))
 
-                    # ── CVaR Optimisation ──────────────────────────────
-                    w    = cp.Variable(n)
-                    aux  = cp.Variable()          # VaR threshold
-                    z    = cp.Variable(T)          # CVaR aux vars
-                    port_ret = rets @ w
-                    k    = int(np.ceil((1 - alpha_cv) * T))
-
+                    # ── CVaR minimisation ──────────────────────────────
+                    w   = cp.Variable(n)
+                    aux = cp.Variable()
+                    z   = cp.Variable(T_rows)
+                    pr  = rets @ w
                     constraints = [
-                        cp.sum(w) == 1,
-                        w >= 0,
-                        w <= max_weight,
-                        z >= 0,
-                        z >= -port_ret - aux,
+                        cp.sum(w) == 1, w >= 0, w <= max_wt,
+                        z >= 0, z >= -pr - aux,
                     ]
-                    cvar_obj = aux + (1 / float(k)) * cp.sum(z)
-                    prob = cp.Problem(cp.Minimize(cvar_obj), constraints)
+                    prob = cp.Problem(
+                        cp.Minimize(aux + (1 / float(k)) * cp.sum(z)),
+                        constraints,
+                    )
                     prob.solve(solver=cp.SCS, verbose=False)
 
-                    if prob.status not in ["optimal","optimal_inaccurate"]:
-                        st.error(f"Solver status: {prob.status}"); st.stop()
+                    if prob.status not in ("optimal", "optimal_inaccurate"):
+                        st.error(f"Solver status: {prob.status}")
+                        st.stop()
 
-                    w_cvar = np.array(w.value).flatten()
-                    w_cvar = np.maximum(w_cvar, 0)
+                    w_cvar = np.maximum(np.array(w.value).flatten(), 0)
                     w_cvar /= w_cvar.sum()
 
                     # Equal weight
                     w_eq = np.ones(n) / n
 
-                    # Max Sharpe (simple numerical approach)
+                    # Max Sharpe via SLSQP
                     mu  = rets.mean(axis=0) * 252
                     cov = np.cov(rets.T) * 252
 
-                    def neg_sharpe(w, mu, cov, rf=0.05):
-                        pr = w @ mu
-                        pv = np.sqrt(w @ cov @ w)
-                        return -(pr - rf) / pv if pv > 0 else 1e9
+                    def neg_sharpe(ww, mu, cov, rf=0.05):
+                        pret = ww @ mu
+                        pvol = np.sqrt(ww @ cov @ ww)
+                        return -(pret - rf) / pvol if pvol > 0 else 1e9
 
-                    from scipy.optimize import minimize
-                    bounds = [(0, max_weight)] * n
-                    cons_ms = [{"type":"eq","fun": lambda w: w.sum()-1}]
-                    res_ms = minimize(neg_sharpe, w_eq, args=(mu, cov),
-                                      method="SLSQP", bounds=bounds, constraints=cons_ms,
-                                      options={"maxiter":500})
+                    res_ms = sp_minimize(
+                        neg_sharpe, w_eq, args=(mu, cov), method="SLSQP",
+                        bounds=[(0, max_wt)] * n,
+                        constraints=[{"type": "eq", "fun": lambda ww: ww.sum() - 1}],
+                        options={"maxiter": 500},
+                    )
                     w_ms = np.maximum(res_ms.x, 0); w_ms /= w_ms.sum()
 
-                    def port_stats(w, rets):
-                        pr = (rets @ w)
-                        ann_ret = (1+pr).prod() ** (252/len(pr)) - 1
-                        ann_vol = pr.std() * np.sqrt(252)
+                    def port_stats(ww):
+                        pr_s = rets @ ww
+                        ann_ret = (1 + pr_s).prod() ** (252 / T_rows) - 1
+                        ann_vol = pr_s.std() * np.sqrt(252)
                         sharpe  = (ann_ret - 0.05) / ann_vol if ann_vol > 0 else 0
-                        sorted_pr = np.sort(pr)
-                        k2 = max(1, int(np.floor((1 - alpha_cv) * len(pr))))
-                        cvar_val = -sorted_pr[:k2].mean()
-                        cum = (1+pr).cumprod()
-                        dd  = ((cum / cum.cummax()) - 1).min()
-                        return dict(ann_ret=ann_ret*100, ann_vol=ann_vol*100,
-                                    sharpe=sharpe, cvar=cvar_val*100, max_dd=dd*100)
+                        k2      = max(1, int(np.floor((1 - alpha_cv) * T_rows)))
+                        cvar_v  = -np.sort(pr_s)[:k2].mean()
+                        cum     = (1 + pr_s).cumprod()
+                        max_dd  = ((cum / np.maximum.accumulate(cum)) - 1).min()
+                        return dict(
+                            ann_ret=ann_ret * 100, ann_vol=ann_vol * 100,
+                            sharpe=sharpe, cvar=cvar_v * 100, max_dd=max_dd * 100,
+                        )
 
-                    stats_cvar = port_stats(w_cvar, rets)
-                    stats_eq   = port_stats(w_eq,   rets)
-                    stats_ms   = port_stats(w_ms,   rets)
+                    s_cvar = port_stats(w_cvar)
+                    s_eq   = port_stats(w_eq)
+                    s_ms   = port_stats(w_ms)
 
-                    cum_cvar = (1 + rets@w_cvar).cumprod()
-                    cum_eq   = (1 + rets@w_eq).cumprod()
-                    cum_ms   = (1 + rets@w_ms).cumprod()
                     dates    = raw.index[1:]
+                    cum_cvar = (1 + rets @ w_cvar).cumprod()
+                    cum_eq   = (1 + rets @ w_eq).cumprod()
+                    cum_ms   = (1 + rets @ w_ms).cumprod()
 
-                    # ── Charts ─────────────────────────────────────────
-                    fig = make_subplots(rows=1, cols=2,
-                                        column_widths=[0.62, 0.38],
-                                        subplot_titles=["Cumulative Return", "CVaR-Optimal Weights"])
+                    fig = make_subplots(
+                        rows=1, cols=2, column_widths=[0.62, 0.38],
+                        subplot_titles=["Cumulative Return", "CVaR-Optimal Weights"],
+                    )
 
                     for cum, name, col, dash in [
                         (cum_cvar, "CVaR-Optimal", "#00d4aa", "solid"),
                         (cum_eq,   "Equal Weight", "#7d8590", "dot"),
                         (cum_ms,   "Max Sharpe",   "#f7c948", "dash"),
                     ]:
-                        fig.add_trace(go.Scatter(x=dates, y=cum, mode="lines",
-                                                 line=dict(color=col, width=2, dash=dash),
-                                                 name=name), row=1, col=1)
+                        fig.add_trace(go.Scatter(
+                            x=dates, y=cum, mode="lines",
+                            line=dict(color=col, width=2, dash=dash), name=name,
+                        ), row=1, col=1)
                     fig.add_hline(y=1, line_color="#21262d", line_width=0.8)
 
-                    # Weight bar chart
-                    sorted_idx = np.argsort(w_cvar)[::-1]
-                    bar_colors = ["#00d4aa" if w_cvar[i] > 0.001 else "#21262d" for i in sorted_idx]
+                    order = np.argsort(w_cvar)[::-1]
+                    bar_colors = ["#00d4aa" if w_cvar[i] > 0.001 else "#21262d" for i in order]
                     fig.add_trace(go.Bar(
-                        x=[tlist[i] for i in sorted_idx],
-                        y=[w_cvar[i]*100 for i in sorted_idx],
-                        marker_color=bar_colors, showlegend=False, name="Weights"
+                        x=[tlist[i] for i in order],
+                        y=[w_cvar[i] * 100 for i in order],
+                        marker_color=bar_colors, showlegend=False, name="Weights",
                     ), row=1, col=2)
 
-                    fig.update_layout(
-                        paper_bgcolor="#080c10", plot_bgcolor="#080c10",
-                        font=dict(family="Space Mono", color="#7d8590", size=10),
-                        legend=dict(orientation="h", y=1.05, bgcolor="rgba(0,0,0,0)",
-                                    font=dict(color="#e6edf3", size=10)),
-                        height=420, margin=dict(l=10, r=10, t=40, b=10),
-                    )
-                    for c in [1,2]:
-                        fig.update_xaxes(gridcolor="#161b22", showgrid=True, zeroline=False, row=1, col=c)
-                        fig.update_yaxes(gridcolor="#161b22", showgrid=True, zeroline=False, row=1, col=c)
+                    fig.update_layout(**PLOT_LAYOUT, height=420)
+                    _style_axes(fig, rows=1, cols=2)
                     fig.update_yaxes(title_text="Growth of $1", row=1, col=1)
-                    fig.update_yaxes(title_text="Weight (%)", row=1, col=2)
-                    fig.update_annotations(font=dict(family="Space Mono", color="#7d8590", size=9))
+                    fig.update_yaxes(title_text="Weight (%)",   row=1, col=2)
+                    st.plotly_chart(fig, use_container_width=True)
 
-                    st.plotly_chart(fig, width="stretch")
+                    # Comparison table
+                    st.markdown("<hr class='div'>", unsafe_allow_html=True)
+                    st.markdown(
+                        "<div style='font-family:Space Mono,monospace;font-size:0.68rem;color:#7d8590;"
+                        "text-transform:uppercase;letter-spacing:0.1em;margin-bottom:0.75rem;'>"
+                        "Performance Comparison</div>",
+                        unsafe_allow_html=True,
+                    )
 
-                    # ── Comparison table ───────────────────────────────
-                    st.markdown("<hr class='divider'>", unsafe_allow_html=True)
-                    st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.72rem;color:#7d8590;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:0.75rem;'>Performance Comparison</div>", unsafe_allow_html=True)
+                    def fmt_val(v, pct=True, pos_good=True):
+                        s   = f"{v:+.2f}%" if pct else f"{v:.3f}"
+                        col = "#26a641" if (v > 0) == pos_good else "#da3633"
+                        return f'<span style="color:{col};font-family:Space Mono,monospace;font-size:0.75rem;">{s}</span>'
 
-                    def fmt(v, pct=True, pos_good=True):
-                        s = f"{v:+.2f}%" if pct else f"{v:.3f}"
-                        color = "#26a641" if (v > 0) == pos_good else "#da3633"
-                        return f'<span style="color:{color};font-family:Space Mono,monospace;font-size:0.78rem;">{s}</span>'
-
-                    rows = [
-                        ("Ann. Return",  [stats_cvar["ann_ret"], stats_eq["ann_ret"], stats_ms["ann_ret"]], True, True),
-                        ("Ann. Volatility", [stats_cvar["ann_vol"], stats_eq["ann_vol"], stats_ms["ann_vol"]], True, False),
-                        ("Sharpe Ratio", [stats_cvar["sharpe"], stats_eq["sharpe"], stats_ms["sharpe"]], False, True),
-                        (f"CVaR {int(alpha_cv*100)}%", [stats_cvar["cvar"], stats_eq["cvar"], stats_ms["cvar"]], True, False),
-                        ("Max Drawdown", [stats_cvar["max_dd"], stats_eq["max_dd"], stats_ms["max_dd"]], True, False),
+                    table_rows = [
+                        ("Ann. Return",      [s_cvar["ann_ret"], s_eq["ann_ret"], s_ms["ann_ret"]], True,  True),
+                        ("Ann. Volatility",  [s_cvar["ann_vol"], s_eq["ann_vol"], s_ms["ann_vol"]], True,  False),
+                        ("Sharpe Ratio",     [s_cvar["sharpe"],  s_eq["sharpe"],  s_ms["sharpe"]],  False, True),
+                        (f"CVaR {int(alpha_cv*100)}%", [s_cvar["cvar"], s_eq["cvar"], s_ms["cvar"]], True, False),
+                        ("Max Drawdown",     [s_cvar["max_dd"], s_eq["max_dd"], s_ms["max_dd"]],    True,  False),
                     ]
 
-                    table_html = """<table class='stats-table'>
-                    <tr><th>Metric</th><th style="color:#00d4aa;">CVaR-Optimal</th><th>Equal Weight</th><th style="color:#f7c948;">Max Sharpe</th></tr>"""
-                    for label, vals, pct, pos_good in rows:
-                        table_html += f"<tr><td style='color:#7d8590;'>{label}</td>"
+                    tbl = (
+                        "<table class='stats-table'>"
+                        "<tr><th>Metric</th>"
+                        "<th style='color:#00d4aa;'>CVaR-Optimal</th>"
+                        "<th>Equal Weight</th>"
+                        "<th style='color:#f7c948;'>Max Sharpe</th></tr>"
+                    )
+                    for lbl, vals, pct, pos_good in table_rows:
+                        tbl += f"<tr><td style='color:#7d8590;'>{lbl}</td>"
                         for v in vals:
-                            table_html += f"<td>{fmt(v, pct, pos_good)}</td>"
-                        table_html += "</tr>"
-                    table_html += "</table>"
-                    st.markdown(table_html, unsafe_allow_html=True)
+                            tbl += f"<td>{fmt_val(v, pct, pos_good)}</td>"
+                        tbl += "</tr>"
+                    tbl += "</table>"
+                    st.markdown(tbl, unsafe_allow_html=True)
 
-                    # Weight allocation detail
-                    st.markdown("<hr class='divider'>", unsafe_allow_html=True)
-                    st.markdown("<div style='font-family:Space Mono,monospace;font-size:0.72rem;color:#7d8590;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:0.75rem;'>CVaR-Optimal Allocation Detail</div>", unsafe_allow_html=True)
+                    # Per-asset detail
+                    st.markdown("<hr class='div'>", unsafe_allow_html=True)
+                    st.markdown(
+                        "<div style='font-family:Space Mono,monospace;font-size:0.68rem;color:#7d8590;"
+                        "text-transform:uppercase;letter-spacing:0.1em;margin-bottom:0.75rem;'>"
+                        "CVaR-Optimal Allocation Detail</div>",
+                        unsafe_allow_html=True,
+                    )
 
-                    alloc_html = "<table class='stats-table'><tr><th>Ticker</th><th>CVaR Weight</th><th>Equal Weight</th><th>Max Sharpe</th><th>Ann. Return</th><th>Ann. Vol</th></tr>"
-                    for i in sorted_idx:
-                        ticker_i = tlist[i]
-                        col_rets = rets[:, i]
-                        a_ret_i  = ((1+col_rets).prod()**(252/len(col_rets))-1)*100
-                        a_vol_i  = col_rets.std()*np.sqrt(252)*100
-                        alloc_html += f"""<tr>
-                            <td style='color:#e6edf3;font-weight:500;'>{ticker_i}</td>
-                            <td style='color:#00d4aa;'>{w_cvar[i]*100:.1f}%</td>
-                            <td style='color:#7d8590;'>{w_eq[i]*100:.1f}%</td>
-                            <td style='color:#f7c948;'>{w_ms[i]*100:.1f}%</td>
-                            <td class='{"pos" if a_ret_i>0 else "neg"}'>{a_ret_i:+.1f}%</td>
-                            <td style='color:#7d8590;'>{a_vol_i:.1f}%</td>
-                        </tr>"""
-                    alloc_html += "</table>"
-                    st.markdown(alloc_html, unsafe_allow_html=True)
-                    st.caption(f"α = {alpha_cv:.0%}  ·  Max single weight = {max_weight:.0%}  ·  Solver: CVXPY/SCS  ·  Assets: {n}")
+                    alloc = (
+                        "<table class='stats-table'>"
+                        "<tr><th>Ticker</th><th>CVaR Wt</th><th>Equal Wt</th>"
+                        "<th>Max Sharpe</th><th>Ann. Ret</th><th>Ann. Vol</th></tr>"
+                    )
+                    for i in order:
+                        cr = rets[:, i]
+                        ar = ((1 + cr).prod() ** (252 / T_rows) - 1) * 100
+                        av = cr.std() * np.sqrt(252) * 100
+                        cls_r = "pos" if ar > 0 else "neg"
+                        alloc += (
+                            f"<tr>"
+                            f"<td style='color:#e6edf3;font-weight:500;'>{tlist[i]}</td>"
+                            f"<td style='color:#00d4aa;'>{w_cvar[i]*100:.1f}%</td>"
+                            f"<td style='color:#7d8590;'>{w_eq[i]*100:.1f}%</td>"
+                            f"<td style='color:#f7c948;'>{w_ms[i]*100:.1f}%</td>"
+                            f"<td class='{cls_r}'>{ar:+.1f}%</td>"
+                            f"<td style='color:#7d8590;'>{av:.1f}%</td>"
+                            f"</tr>"
+                        )
+                    alloc += "</table>"
+                    st.markdown(alloc, unsafe_allow_html=True)
+                    st.caption(
+                        f"α = {alpha_cv:.0%}  ·  Max single weight = {max_wt:.0%}  ·  "
+                        f"Solver: CVXPY/SCS  ·  Assets: {n}"
+                    )
 
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
                     import traceback; st.code(traceback.format_exc())
         else:
-            st.markdown("""
-            <div style="border:1px dashed #21262d;border-radius:8px;padding:3rem;text-align:center;margin-top:1rem;">
-                <div style="font-family:'Space Mono',monospace;font-size:0.75rem;color:#7d8590;">
-                    Enter tickers and click <strong style="color:#00d4aa;">Optimise Portfolio</strong><br>
-                    <span style="font-size:0.65rem;">CVaR minimisation via convex optimisation (CVXPY)</span>
-                </div>
-            </div>""", unsafe_allow_html=True)
+            placeholder(
+                "Enter tickers and click <strong style='color:#00d4aa;'>Optimise Portfolio</strong><br>"
+                "<span style='font-size:0.62rem;'>CVaR minimisation via convex optimisation (CVXPY)</span>"
+            )
