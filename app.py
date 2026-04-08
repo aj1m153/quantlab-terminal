@@ -10,6 +10,7 @@ import datetime as dt
 import io
 import urllib.request
 
+import requests
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -28,6 +29,35 @@ try:
     from yfinance.exceptions import YFRateLimitError as _YFRateErr
 except ImportError:
     _YFRateErr = None
+
+# Browser-spoofed session — Yahoo blocks datacenter IPs on the options endpoint
+# without realistic headers. Reuse a single session across all Ticker() calls.
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT":             "1",
+        "Connection":      "keep-alive",
+    })
+    return s
+
+_SESSION = _make_session()
+
+
+def _ticker(symbol: str) -> yf.Ticker:
+    """Return a Ticker wired up with the spoofed session."""
+    try:
+        return yf.Ticker(symbol, session=_SESSION)
+    except TypeError:
+        # Older yfinance builds don't accept session= keyword
+        return yf.Ticker(symbol)
 
 
 def _is_rate_limit(exc: Exception) -> bool:
@@ -50,7 +80,7 @@ def yf_download(tickers, period: str, auto_adjust: bool = True) -> pd.DataFrame:
                 tickers, period=period,
                 auto_adjust=auto_adjust,
                 progress=False,
-                threads=False,   # single-threaded — avoids burst rate-limit
+                threads=False,
             )
             if not data.empty:
                 return data
@@ -65,18 +95,18 @@ def yf_download(tickers, period: str, auto_adjust: bool = True) -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def yf_options_expiries(symbol: str):
     """
-    Fetch option expiry dates. Retries on both exceptions AND empty returns,
-    since yfinance silently returns () when rate-limited on the options endpoint.
+    Fetch option expiry dates using the spoofed session.
+    Retries on both exceptions AND silent empty returns.
     """
     for attempt in range(6):
         try:
-            exps = yf.Ticker(symbol).options
-            if exps:                 # non-empty → genuine result
+            exps = _ticker(symbol).options
+            if exps:
                 return exps
-            if attempt < 4:          # empty could be a silent rate-limit
+            if attempt < 4:
                 _backoff(attempt)
                 continue
-            return ()                # still empty after retries → no options
+            return ()
         except Exception as exc:
             if _is_rate_limit(exc):
                 _backoff(attempt)
@@ -90,7 +120,7 @@ def yf_option_chain(symbol: str, expiry: str):
     """Returns (calls_df, puts_df) — plain DataFrames are always serialisable."""
     for attempt in range(5):
         try:
-            chain = yf.Ticker(symbol).option_chain(expiry)
+            chain = _ticker(symbol).option_chain(expiry)
             return chain.calls.copy(), chain.puts.copy()
         except Exception as exc:
             if _is_rate_limit(exc):
@@ -104,11 +134,12 @@ def yf_option_chain(symbol: str, expiry: str):
 def yf_spot(symbol: str) -> float | None:
     for attempt in range(5):
         try:
-            fi = yf.Ticker(symbol).fast_info
+            t   = _ticker(symbol)
+            fi  = t.fast_info
             price = getattr(fi, "last_price", None) or getattr(fi, "regular_market_price", None)
             if price:
                 return float(price)
-            hist = yf.Ticker(symbol).history(period="1d")
+            hist = t.history(period="1d")
             if not hist.empty:
                 return float(hist["Close"].iloc[-1])
         except Exception as exc:
